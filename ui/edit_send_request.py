@@ -21,6 +21,7 @@ class EditSendRequest(tk.Toplevel):
         sequence="",
         row_count=1,
         periodic=False,
+        repeat_interval=0.0,
         checksum=None,
         display_mode="HEX",
     ):
@@ -43,6 +44,7 @@ class EditSendRequest(tk.Toplevel):
         self._name = name
         self._sequence = sequence
         self._periodic = periodic
+        self._repeat_interval = repeat_interval
         self._checksum = checksum or DEFAULT_CHECKSUM
         self._display_mode = display_mode if display_mode in ("ASCII", "HEX", "Decimal", "Binary") else "HEX"
         self._build_layout()
@@ -160,6 +162,10 @@ class EditSendRequest(tk.Toplevel):
             return None
         if len(token) == 2 and all(ch in "0123456789ABCDEFabcdef" for ch in token):
             return int(token, 16)
+        if token.isdigit():
+            value = int(token)
+            if 0 <= value <= 255:
+                return value
         return None
 
     def _token_to_display(self, token, mode):
@@ -218,9 +224,7 @@ class EditSendRequest(tk.Toplevel):
         if mode == "HEX":
             return bool(re.fullmatch(r"[0-9A-Fa-f]{0,2}", proposed))
         if mode == "Decimal":
-            if not proposed.isdigit() or len(proposed) > 3:
-                return False
-            return int(proposed) <= 255
+            return proposed.isdigit() and len(proposed) <= 3
         if mode == "Binary":
             return bool(re.fullmatch(r"[01]{0,8}", proposed))
         return len(proposed) <= 1
@@ -274,7 +278,8 @@ class EditSendRequest(tk.Toplevel):
             cell.pack(side=tk.LEFT, padx=2)
             cell.bind("<FocusIn>", lambda _e, idx=index: self._update_position_label(idx))
             cell.bind("<KeyRelease>", lambda _e, idx=index: self._on_cell_changed(idx))
-            cell.bind("<Return>", lambda _e, idx=index: self._on_cell_enter(idx))
+            cell.bind("<Left>", lambda e, idx=index: self._on_cell_arrow(e, idx, -1))
+            cell.bind("<Right>", lambda e, idx=index: self._on_cell_arrow(e, idx, 1))
             self._byte_cells.append(cell)
 
         if focus_index is not None and 0 <= focus_index < len(self._byte_cells):
@@ -289,23 +294,45 @@ class EditSendRequest(tk.Toplevel):
     def _on_cell_changed(self, index):
         if index >= len(self._byte_cells):
             return
-        self._cell_values[index] = self._byte_cells[index].get()
+
+        value = self._byte_cells[index].get()
+        mode = self.edit_mode.get()
+
+        if mode == "Decimal" and value.isdigit() and int(value) > 255:
+            value = "255"
+            self._byte_cells[index].delete(0, tk.END)
+            self._byte_cells[index].insert(0, value)
+
+        self._cell_values[index] = value
         self._update_position_label(index)
         self._update_checksum_preview()
 
-    def _on_cell_enter(self, index):
+        if (
+            mode == "ASCII"
+            and len(value) == 1
+            and not PLACEHOLDER_PATTERN.match(value)
+        ):
+            self._advance_focus(index)
+
+    def _focus_cell(self, index):
+        if 0 <= index < len(self._byte_cells):
+            self._byte_cells[index].focus_set()
+            self._update_position_label(index)
+
+    def _on_cell_arrow(self, _event, index, direction):
+        self._focus_cell(index + direction)
+        return "break"
+
+    def _advance_focus(self, index):
         self._sync_cells_from_entries()
         if not self._byte_cells[index].get().strip():
-            return "break"
+            return
 
         if index < len(self._byte_cells) - 1:
-            self._byte_cells[index + 1].focus_set()
-            self._update_position_label(index + 1)
+            self._focus_cell(index + 1)
         else:
             self._cell_values.append("")
             self._render_sequence_cells(focus_index=index + 1)
-
-        return "break"
 
     def _update_position_label(self, index):
         filled = sum(1 for value in self._cell_values if value.strip())
@@ -317,7 +344,7 @@ class EditSendRequest(tk.Toplevel):
             if index < len(self._cell_values):
                 self._cell_values[index] = cell.get()
 
-    def _on_edit_mode_changed(self):
+    def _on_edit_mode_changed(self, skip_global_sync=False):
         if self._updating_mode:
             return
 
@@ -343,6 +370,17 @@ class EditSendRequest(tk.Toplevel):
         self._previous_mode = new_mode
         self._render_sequence_cells()
         self._update_checksum_preview()
+
+        if not skip_global_sync and hasattr(self.home, "apply_global_display_mode"):
+            self.home.apply_global_display_mode(new_mode)
+
+    def update_display_mode_from_global(self, mode):
+        if self.edit_mode.get() == mode:
+            return
+        self._updating_mode = True
+        self.edit_mode.set(mode)
+        self._updating_mode = False
+        self._on_edit_mode_changed(skip_global_sync=True)
 
     def _get_sequence_bytes(self):
         try:
@@ -413,9 +451,9 @@ class EditSendRequest(tk.Toplevel):
         tk.Label(repeat_row, text="Repeat sequence every", bg="#d9d9d9").pack(
             side=tk.LEFT
         )
-        seconds_entry = ttk.Entry(repeat_row, width=5)
-        seconds_entry.insert(0, "0")
-        seconds_entry.pack(side=tk.LEFT, padx=4)
+        self.repeat_seconds_entry = ttk.Entry(repeat_row, width=5)
+        self.repeat_seconds_entry.insert(0, self._format_repeat_interval(self._repeat_interval))
+        self.repeat_seconds_entry.pack(side=tk.LEFT, padx=4)
         tk.Label(repeat_row, text="seconds", bg="#d9d9d9").pack(side=tk.LEFT)
 
         self.checksum_combo = ttk.Combobox(
@@ -456,6 +494,25 @@ class EditSendRequest(tk.Toplevel):
 
         notebook.select(0)
 
+    @staticmethod
+    def _format_repeat_interval(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = 0.0
+        if number == int(number):
+            return str(int(number))
+        return str(number)
+
+    def _get_repeat_interval(self):
+        value = self.repeat_seconds_entry.get().strip()
+        if not value:
+            return 0.0
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            return 0.0
+
     def _build_footer(self, parent):
         footer = tk.Frame(parent, bg="#d9d9d9", padx=12)
         footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 10))
@@ -483,6 +540,7 @@ class EditSendRequest(tk.Toplevel):
             name,
             sequence,
             periodic=self.periodic_var.get(),
+            repeat_interval=self._get_repeat_interval(),
             checksum=self.checksum_combo.get(),
             display_mode=self.edit_mode.get(),
         )

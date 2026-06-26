@@ -14,6 +14,7 @@ class ReceiveMatch:
     name: str
     data: bytes
     checksum_ok: Optional[bool]
+    row_index: int
 
 
 def _is_active(flag: str) -> bool:
@@ -36,7 +37,7 @@ def find_matches(
     """Return receive-sequence hits for one RX frame."""
     matches: List[ReceiveMatch] = []
 
-    for row in receive_rows:
+    for row_index, row in enumerate(receive_rows):
         active, name, sequence, checksum_rule, detect_mode, *_ = normalize_row(row)
         if not _is_active(active):
             continue
@@ -51,7 +52,14 @@ def find_matches(
         rule_id = parse_rule(checksum_rule)
         if rule_id == "off":
             if data == pattern or pattern in data:
-                matches.append(ReceiveMatch(name=name, data=data, checksum_ok=None))
+                matches.append(
+                    ReceiveMatch(
+                        name=name,
+                        data=data,
+                        checksum_ok=None,
+                        row_index=row_index,
+                    )
+                )
             continue
 
         if not (data.startswith(pattern) and len(data) >= len(pattern) + 1):
@@ -60,7 +68,12 @@ def find_matches(
         checksum_ok = verify_checksum(data, checksum_rule)
         if _checksum_accepted(checksum_ok, detect_mode):
             matches.append(
-                ReceiveMatch(name=name, data=data, checksum_ok=checksum_ok)
+                ReceiveMatch(
+                    name=name,
+                    data=data,
+                    checksum_ok=checksum_ok,
+                    row_index=row_index,
+                )
             )
 
     return matches

@@ -11,9 +11,15 @@ from core.checksum_rules import (
     DEFAULT_CHECKSUM,
     DEFAULT_CHECKSUM_DETECT,
 )
+from core.receive_actions import (
+    ACTION_TYPES,
+    ReceiveActionConfig,
+    default_comment_text,
+)
 from core.sequence_codec import SequenceEncodeError, encode_sequence
 
 PLACEHOLDER_PATTERN = re.compile(r"^<[^>]+>$")
+ACTION_TAB_INDEX = {name: index for index, name in enumerate(ACTION_TYPES)}
 
 
 class EditReceiveSequence(tk.Toplevel):
@@ -28,6 +34,7 @@ class EditReceiveSequence(tk.Toplevel):
         checksum=None,
         checksum_detect=None,
         display_mode="HEX",
+        action=None,
     ):
         super().__init__(parent)
         self.home = parent
@@ -38,7 +45,7 @@ class EditReceiveSequence(tk.Toplevel):
         self._updating_mode = False
 
         self.title("Edit Receive Sequence")
-        self.geometry("720x560")
+        self.geometry("720x540")
         self.resizable(False, False)
         self.configure(bg="#d9d9d9")
         self.transient(parent)
@@ -50,10 +57,12 @@ class EditReceiveSequence(tk.Toplevel):
         self._checksum = checksum or DEFAULT_CHECKSUM
         self._checksum_detect = checksum_detect or DEFAULT_CHECKSUM_DETECT
         self._display_mode = display_mode if display_mode in ("ASCII", "HEX", "Decimal", "Binary") else "HEX"
+        self._action = action or ReceiveActionConfig()
         self._build_layout()
         self._previous_mode = self._display_mode
         self._load_sequence_cells()
         self._render_sequence_cells()
+        self._load_action_settings()
 
     def _build_layout(self):
         self._build_footer(self)
@@ -122,31 +131,22 @@ class EditReceiveSequence(tk.Toplevel):
         self._set_index(self.index_entry.get())
 
     def _build_sequence_definition(self, parent):
-        section = tk.Frame(parent, bg="#d9d9d9")
+        section = ttk.LabelFrame(parent, text="Sequence Definition", padding=8)
         section.pack(fill=tk.X)
 
-        tk.Label(
-            section,
-            text="Sequence Definition",
-            bg="#d9d9d9",
-            font=("Segoe UI", 9, "bold"),
-        ).pack(anchor=tk.W, pady=(0, 6))
-
-        name_row = tk.Frame(section, bg="#d9d9d9")
+        name_row = tk.Frame(section)
         name_row.pack(fill=tk.X, pady=2)
-        tk.Label(name_row, text="1 - Name", bg="#d9d9d9", width=12, anchor=tk.W).pack(
-            side=tk.LEFT
-        )
+        tk.Label(name_row, text="1 - Name", width=12, anchor=tk.W).pack(side=tk.LEFT)
         self.name_entry = ttk.Entry(name_row)
         self.name_entry.insert(0, self._name)
         self.name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        seq_header = tk.Frame(section, bg="#d9d9d9")
+        seq_header = tk.Frame(section)
         seq_header.pack(fill=tk.X, pady=(8, 2))
-        tk.Label(seq_header, text="2 - Sequence", bg="#d9d9d9", width=12, anchor=tk.W).pack(
+        tk.Label(seq_header, text="2 - Sequence", width=12, anchor=tk.W).pack(
             side=tk.LEFT
         )
-        tk.Label(seq_header, text="Edit Mode", bg="#d9d9d9").pack(side=tk.LEFT, padx=(0, 8))
+        tk.Label(seq_header, text="Edit Mode").pack(side=tk.LEFT, padx=(0, 8))
 
         self.edit_mode = tk.StringVar(value=self._display_mode)
         for mode in ("ASCII", "HEX", "Decimal", "Binary"):
@@ -158,10 +158,10 @@ class EditReceiveSequence(tk.Toplevel):
                 command=self._on_edit_mode_changed,
             ).pack(side=tk.LEFT, padx=2)
 
-        self.pos_label = tk.Label(seq_header, text="Pos. 0 / 0", bg="#d9d9d9")
+        self.pos_label = tk.Label(seq_header, text="Pos. 0 / 0")
         self.pos_label.pack(side=tk.RIGHT)
 
-        self.seq_area = tk.Frame(section, bg="white", relief=tk.SUNKEN, bd=1, height=80)
+        self.seq_area = tk.Frame(section, bg="white", relief=tk.SUNKEN, bd=1, height=100)
         self.seq_area.pack(fill=tk.X, pady=4)
         self.seq_area.pack_propagate(False)
 
@@ -181,6 +181,10 @@ class EditReceiveSequence(tk.Toplevel):
             return None
         if len(token) == 2 and all(ch in "0123456789ABCDEFabcdef" for ch in token):
             return int(token, 16)
+        if token.isdigit():
+            value = int(token)
+            if 0 <= value <= 255:
+                return value
         return None
 
     def _token_to_display(self, token, mode):
@@ -239,9 +243,7 @@ class EditReceiveSequence(tk.Toplevel):
         if mode == "HEX":
             return bool(re.fullmatch(r"[0-9A-Fa-f]{0,2}", proposed))
         if mode == "Decimal":
-            if not proposed.isdigit() or len(proposed) > 3:
-                return False
-            return int(proposed) <= 255
+            return proposed.isdigit() and len(proposed) <= 3
         if mode == "Binary":
             return bool(re.fullmatch(r"[01]{0,8}", proposed))
         return len(proposed) <= 1
@@ -295,7 +297,8 @@ class EditReceiveSequence(tk.Toplevel):
             cell.pack(side=tk.LEFT, padx=2)
             cell.bind("<FocusIn>", lambda _e, idx=index: self._update_position_label(idx))
             cell.bind("<KeyRelease>", lambda _e, idx=index: self._on_cell_changed(idx))
-            cell.bind("<Return>", lambda _e, idx=index: self._on_cell_enter(idx))
+            cell.bind("<Left>", lambda e, idx=index: self._on_cell_arrow(e, idx, -1))
+            cell.bind("<Right>", lambda e, idx=index: self._on_cell_arrow(e, idx, 1))
             self._byte_cells.append(cell)
 
         if focus_index is not None and 0 <= focus_index < len(self._byte_cells):
@@ -310,23 +313,45 @@ class EditReceiveSequence(tk.Toplevel):
     def _on_cell_changed(self, index):
         if index >= len(self._byte_cells):
             return
-        self._cell_values[index] = self._byte_cells[index].get()
+
+        value = self._byte_cells[index].get()
+        mode = self.edit_mode.get()
+
+        if mode == "Decimal" and value.isdigit() and int(value) > 255:
+            value = "255"
+            self._byte_cells[index].delete(0, tk.END)
+            self._byte_cells[index].insert(0, value)
+
+        self._cell_values[index] = value
         self._update_position_label(index)
         self._update_checksum_preview()
 
-    def _on_cell_enter(self, index):
+        if (
+            mode == "ASCII"
+            and len(value) == 1
+            and not PLACEHOLDER_PATTERN.match(value)
+        ):
+            self._advance_focus(index)
+
+    def _focus_cell(self, index):
+        if 0 <= index < len(self._byte_cells):
+            self._byte_cells[index].focus_set()
+            self._update_position_label(index)
+
+    def _on_cell_arrow(self, _event, index, direction):
+        self._focus_cell(index + direction)
+        return "break"
+
+    def _advance_focus(self, index):
         self._sync_cells_from_entries()
         if not self._byte_cells[index].get().strip():
-            return "break"
+            return
 
         if index < len(self._byte_cells) - 1:
-            self._byte_cells[index + 1].focus_set()
-            self._update_position_label(index + 1)
+            self._focus_cell(index + 1)
         else:
             self._cell_values.append("")
             self._render_sequence_cells(focus_index=index + 1)
-
-        return "break"
 
     def _update_position_label(self, index):
         filled = sum(1 for value in self._cell_values if value.strip())
@@ -338,7 +363,7 @@ class EditReceiveSequence(tk.Toplevel):
             if index < len(self._cell_values):
                 self._cell_values[index] = cell.get()
 
-    def _on_edit_mode_changed(self):
+    def _on_edit_mode_changed(self, skip_global_sync=False):
         if self._updating_mode:
             return
 
@@ -364,6 +389,17 @@ class EditReceiveSequence(tk.Toplevel):
         self._previous_mode = new_mode
         self._render_sequence_cells()
         self._update_checksum_preview()
+
+        if not skip_global_sync and hasattr(self.home, "apply_global_display_mode"):
+            self.home.apply_global_display_mode(new_mode)
+
+    def update_display_mode_from_global(self, mode):
+        if self.edit_mode.get() == mode:
+            return
+        self._updating_mode = True
+        self.edit_mode.set(mode)
+        self._updating_mode = False
+        self._on_edit_mode_changed(skip_global_sync=True)
 
     def _get_sequence_bytes(self):
         try:
@@ -407,66 +443,90 @@ class EditReceiveSequence(tk.Toplevel):
         return " ".join(tokens)
 
     def _build_action_section(self, parent):
-        section = tk.Frame(parent, bg="#d9d9d9")
+        section = ttk.LabelFrame(parent, text="3 - Action", padding=8)
         section.pack(fill=tk.BOTH, expand=True)
 
-        header = tk.Frame(section, bg="#d9d9d9")
-        header.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(header, text="3 - Action", bg="#d9d9d9", width=12, anchor=tk.W).pack(
-            side=tk.LEFT
+        notebook = ttk.Notebook(section)
+        self._action_notebook = notebook
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        answer_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
+        comment_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
+        trigger_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
+        stop_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
+        checksum_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
+
+        notebook.add(answer_tab, text="Answer")
+        notebook.add(comment_tab, text="Comment")
+        notebook.add(trigger_tab, text="Trigger")
+        notebook.add(stop_tab, text="Stop")
+        notebook.add(checksum_tab, text="Checksum")
+
+        self._build_answer_tab(answer_tab)
+        self._build_comment_tab(comment_tab)
+        self._build_trigger_tab(trigger_tab)
+        self._build_stop_tab(stop_tab)
+        self._build_checksum_tab(checksum_tab)
+
+        notebook.select(ACTION_TAB_INDEX.get(self._action.action_type, 0))
+
+    def _parse_answer_send_index(self):
+        value = self.answer_combo.get()
+        if not value:
+            return 0
+        prefix = value.split(":", 1)[0].strip()
+        try:
+            return max(0, int(prefix) - 1)
+        except ValueError:
+            return 0
+
+    def _get_selected_action_type(self):
+        tab_name = self._action_notebook.tab(
+            self._action_notebook.index(self._action_notebook.select()),
+            "text",
+        )
+        if tab_name == "Checksum":
+            return self._action.action_type
+        return tab_name
+
+    def _get_action_config(self):
+        return ReceiveActionConfig(
+            action_type=self._get_selected_action_type(),
+            answer_send_index=self._parse_answer_send_index(),
+            comment_text=self.comment_entry.get(),
+            comment_line_break=self.comment_line_break_var.get(),
+            comment_timestamp=self.comment_timestamp_var.get(),
+            snapshot_trigger=self.snapshot_trigger_var.get(),
+            stop_communication=self.stop_communication_var.get(),
         )
 
-        self._action_tab = "Answer"
-        self._action_tab_buttons = {}
-        tab_bar = tk.Frame(header, bg="#d9d9d9")
-        tab_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+    def _load_action_settings(self):
+        action = self._action
+        self._action_notebook.select(ACTION_TAB_INDEX.get(action.action_type, 0))
 
-        for tab_name in ("Answer", "Comment", "Trigger", "Stop", "Checksum"):
-            button = tk.Button(
-                tab_bar,
-                text=tab_name,
-                relief=tk.RAISED,
-                padx=8,
-                pady=2,
-                bg="#ececec",
-                command=lambda name=tab_name: self._show_action_tab(name),
-            )
-            button.pack(side=tk.LEFT, padx=1)
-            self._action_tab_buttons[tab_name] = button
+        send_options = self._get_send_sequence_options()
+        if send_options:
+            index = action.answer_send_index
+            if 0 <= index < len(send_options):
+                self.answer_combo.set(send_options[index])
+            else:
+                self.answer_combo.set(send_options[0])
 
-        self.action_body = tk.Frame(section, bg="#c8c8c8", relief=tk.SUNKEN, bd=1)
-        self.action_body.pack(fill=tk.BOTH, expand=True)
-
-        self._action_tab_frames = {
-            "Answer": tk.Frame(self.action_body, bg="#c8c8c8", padx=8, pady=8),
-            "Comment": tk.Frame(self.action_body, bg="#c8c8c8", padx=8, pady=8),
-            "Trigger": tk.Frame(self.action_body, bg="#c8c8c8", padx=8, pady=8),
-            "Stop": tk.Frame(self.action_body, bg="#c8c8c8", padx=8, pady=8),
-            "Checksum": tk.Frame(self.action_body, bg="#c8c8c8", padx=8, pady=8),
-        }
-
-        self._build_answer_tab(self._action_tab_frames["Answer"])
-        self._build_comment_tab(self._action_tab_frames["Comment"])
-        self._build_trigger_tab(self._action_tab_frames["Trigger"])
-        self._build_stop_tab(self._action_tab_frames["Stop"])
-        self._build_checksum_tab(self._action_tab_frames["Checksum"])
-        self._show_action_tab("Answer")
-
-    def _show_action_tab(self, tab_name):
-        self._action_tab = tab_name
-        for name, frame in self._action_tab_frames.items():
-            frame.pack_forget()
-
-        self._action_tab_frames[tab_name].pack(fill=tk.BOTH, expand=True)
-
-        for name, button in self._action_tab_buttons.items():
-            button.config(relief=tk.SUNKEN if name == tab_name else tk.RAISED)
+        self.comment_entry.delete(0, tk.END)
+        self.comment_entry.insert(
+            0,
+            action.comment_text or default_comment_text(self._name),
+        )
+        self.comment_line_break_var.set(action.comment_line_break)
+        self.comment_timestamp_var.set(action.comment_timestamp)
+        self.snapshot_trigger_var.set(action.snapshot_trigger)
+        self.stop_communication_var.set(action.stop_communication)
 
     def _build_answer_tab(self, parent):
         tk.Label(
             parent,
             text="Send out the following sequence:",
-            bg="#c8c8c8",
+            bg="#d9d9d9",
             anchor=tk.W,
         ).pack(fill=tk.X, pady=(0, 6))
 
@@ -487,24 +547,20 @@ class EditReceiveSequence(tk.Toplevel):
                 "Only send sequences without any wildcards are valid as an "
                 "automatic answer."
             ),
-            bg="#c8c8c8",
+            bg="#d9d9d9",
             anchor=tk.W,
             wraplength=640,
             justify=tk.LEFT,
         ).pack(fill=tk.X)
 
     def _default_comment_text(self):
-        name = self._name.strip()
-        if not name:
-            return ""
-        first_word = name.split()[0]
-        return '"{}" received'.format(first_word)
+        return default_comment_text(self.name_entry.get().strip() or self._name)
 
     def _build_comment_tab(self, parent):
         tk.Label(
             parent,
             text="Insert the following comment into the communication window:",
-            bg="#c8c8c8",
+            bg="#d9d9d9",
             anchor=tk.W,
             wraplength=640,
             justify=tk.LEFT,
@@ -534,12 +590,12 @@ class EditReceiveSequence(tk.Toplevel):
         tk.Label(
             parent,
             text="Docklight Snapshot Mode",
-            bg="#c8c8c8",
+            bg="#d9d9d9",
             font=("Segoe UI", 9, "bold"),
             anchor=tk.W,
         ).pack(fill=tk.X, pady=(0, 8))
 
-        trigger_row = tk.Frame(parent, bg="#c8c8c8")
+        trigger_row = tk.Frame(parent, bg="#d9d9d9")
         trigger_row.pack(fill=tk.X, anchor=tk.W)
 
         self.snapshot_trigger_var = tk.BooleanVar(value=True)
@@ -553,7 +609,7 @@ class EditReceiveSequence(tk.Toplevel):
                 "appears in the communication data received, Docklight will create "
                 "a snapshot of this data in the communication window."
             ),
-            bg="#c8c8c8",
+            bg="#d9d9d9",
             justify=tk.LEFT,
             wraplength=600,
         ).pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -570,7 +626,7 @@ class EditReceiveSequence(tk.Toplevel):
         ).pack(anchor=tk.W)
 
     def _build_checksum_tab(self, parent):
-        dropdown_row = tk.Frame(parent, bg="#c8c8c8")
+        dropdown_row = tk.Frame(parent, bg="#d9d9d9")
         dropdown_row.pack(fill=tk.X, pady=(0, 6))
 
         self.checksum_combo = ttk.Combobox(
@@ -631,9 +687,12 @@ class EditReceiveSequence(tk.Toplevel):
 
         btn_group = tk.Frame(footer, bg="#d9d9d9")
         btn_group.pack(side=tk.RIGHT)
-        ttk.Button(btn_group, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=4)
-        ttk.Button(btn_group, text="Cancel", command=self.destroy).pack(side=tk.LEFT)
-        ttk.Button(btn_group, text="Apply", command=self._on_apply).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_group, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_group, text="Cancel", command=self.destroy).pack(
+            side=tk.LEFT, padx=2
+        )
+        ttk.Button(btn_group, text="Apply", command=self._on_apply).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_group, text="Help").pack(side=tk.LEFT, padx=2)
 
     def _save_sequence(self):
         name = self.name_entry.get().strip()
@@ -647,7 +706,9 @@ class EditReceiveSequence(tk.Toplevel):
             checksum=self.checksum_combo.get(),
             checksum_detect=self.detect_combo.get(),
             display_mode=self.edit_mode.get(),
+            action=self._get_action_config(),
         )
+        self._action = self._get_action_config()
         self._row_index = new_index
 
     def _on_ok(self):

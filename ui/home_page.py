@@ -6,10 +6,26 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from core.checksum import ChecksumError, append_checksum
+from core.comm_display import (
+    format_comm_segments,
+    format_line_ending_segments,
+    iter_comm_lines,
+)
 from core.comm_service import CommService, ErrorEvent, RxEvent, TxEvent
 from core.checksum_rules import DEFAULT_CHECKSUM
+from core.receive_actions import (
+    ReceiveActionConfig,
+    default_comment_text,
+    parse_receive_action,
+    receive_action_fields,
+)
 from core.receive_matcher import find_matches
-from core.sequence_codec import SequenceEncodeError, encode_sequence, format_sequence_display
+from core.sequence_codec import (
+    PLACEHOLDER_PATTERN,
+    SequenceEncodeError,
+    encode_sequence,
+    format_sequence_display,
+)
 from project_settings import ProjectSettings
 from route.routes import Routes
 from ui.edit_receive_sequence import DEFAULT_CHECKSUM_DETECT
@@ -26,6 +42,9 @@ class HomePage(tk.Tk):
         self._send_rows = []
         self._receive_rows = []
         self._send_buttons = {}
+        self._repeat_after_ids = {}
+        self._global_display_mode = "HEX"
+        self._updating_display_mode = False
         self.project_settings = ProjectSettings()
         self._communication_open = False
         self._comm_texts = {}
@@ -127,6 +146,7 @@ class HomePage(tk.Tk):
         ).pack(side=tk.LEFT)
 
     def _on_close(self):
+        self.stop_repeat_senders()
         self.comm_service.disconnect()
         self.destroy()
 
@@ -140,11 +160,10 @@ class HomePage(tk.Tk):
             matches = find_matches(
                 event.data, self._receive_rows, self._normalize_receive_row
             )
-            label = matches[0].name if matches else ""
-            self._append_comm_data(event.data, "RX", label)
-            self._check_receive_matches(matches)
+            self._append_comm_data(event.data, "RX")
+            self._handle_receive_matches(matches)
         elif isinstance(event, ErrorEvent):
-            self._append_comm_line("[ERR] {}".format(event.message), tag="error")
+            self._append_comm_line("[ERR] {}".format(event.message), tag="error", direction="RX")
             self.routes.stop_communication()
 
     @staticmethod
@@ -159,52 +178,161 @@ class HomePage(tk.Tk):
     @staticmethod
     def _configure_comm_tags(text_widget):
         text_widget.tag_configure("meta", foreground="#008000")
-        text_widget.tag_configure("rx_data", foreground="#CC0000")
+        text_widget.tag_configure("rx_data", foreground="#8B0000")
         text_widget.tag_configure("tx_data", foreground="#0000FF")
-        text_widget.tag_configure("separator", foreground="#000000")
+        text_widget.tag_configure("separator", foreground="#008000")
         text_widget.tag_configure("status", foreground="#008000")
         text_widget.tag_configure("error", foreground="#CC0000")
 
-    def _append_comm_line(self, line, tag="status"):
+    def _insert_comm_header(self, text_widget, direction):
+        timestamp = self._format_comm_timestamp()
+        text_widget.insert(tk.END, timestamp + " ", "meta")
+        text_widget.insert(tk.END, "[{}]".format(direction), "meta")
+        text_widget.insert(tk.END, " - ", "meta")
+
+    def _insert_comm_payload(self, text_widget, data, mode, data_tag):
+        for text, segment_tag in format_comm_segments(data, mode):
+            widget_tag = "meta" if segment_tag == "control" else data_tag
+            text_widget.insert(tk.END, text, widget_tag)
+
+    def _insert_comm_line_ending(self, text_widget, ending):
+        for text, _segment_tag in format_line_ending_segments(ending):
+            text_widget.insert(tk.END, text, "meta")
+
+    def _append_comm_line(self, line, tag="status", direction="RX"):
         if not self._comm_texts:
             return
 
         for text_widget in self._comm_texts.values():
-            text_widget.insert(tk.END, line + "\n", tag)
+            self._insert_comm_header(text_widget, direction)
+            text_widget.insert(tk.END, line, tag)
+            text_widget.insert(tk.END, "\n")
             text_widget.see(tk.END)
 
     def _append_comm_data(self, data, direction, label=""):
         if not self._comm_texts:
             return
 
-        timestamp = self._format_comm_timestamp()
-        data_tag = "rx_data" if direction == "RX" else "tx_data"
-        payloads = {
-            "HEX": " ".join("{:02X}".format(byte) for byte in data),
-            "ASCII": "".join(
-                chr(byte) if 32 <= byte < 127 else "." for byte in data
-            ),
-            "Decimal": " ".join(str(byte) for byte in data),
-            "Binary": " ".join("{:08b}".format(byte) for byte in data),
-        }
+        lines = list(iter_comm_lines(data))
+        if not lines and data:
+            lines = [(data, b"")]
 
-        for tab_name, payload in payloads.items():
-            text_widget = self._comm_texts[tab_name]
-            text_widget.insert(tk.END, timestamp + " ", "meta")
-            text_widget.insert(tk.END, "[{}]".format(direction), "meta")
-            text_widget.insert(tk.END, " - ", "separator")
-            text_widget.insert(tk.END, payload, data_tag)
-            if label:
-                text_widget.insert(tk.END, "  {}".format(label), "meta")
-            text_widget.insert(tk.END, "\n")
+        data_tag = "rx_data" if direction == "RX" else "tx_data"
+
+        for tab_name, text_widget in self._comm_texts.items():
+            for index, (line_bytes, ending) in enumerate(lines):
+                if index == 0:
+                    self._insert_comm_header(text_widget, direction)
+
+                self._insert_comm_payload(text_widget, line_bytes, tab_name, data_tag)
+                self._insert_comm_line_ending(text_widget, ending)
+
+                if label and index == 0:
+                    text_widget.insert(tk.END, "  {}".format(label), "meta")
+
+                text_widget.insert(tk.END, "\n")
+
             text_widget.see(tk.END)
 
-    def _check_receive_matches(self, matches):
+    def _append_comm_comment(self, text, include_timestamp=False, extra_line_break=False):
+        if not self._comm_texts or not text:
+            return
+
+        line = text
+        if include_timestamp:
+            line = "{}  {}".format(line, self._format_comm_timestamp())
+
+        for text_widget in self._comm_texts.values():
+            self._insert_comm_header(text_widget, "RX")
+            text_widget.insert(tk.END, line, "meta")
+            text_widget.insert(tk.END, "\n")
+            if extra_line_break:
+                text_widget.insert(tk.END, "\n")
+            text_widget.see(tk.END)
+
+    def _handle_receive_matches(self, matches):
         for match in matches:
             if match.checksum_ok is False:
                 self._append_comm_line(
                     'Checksum wrong for receive sequence "{}".'.format(match.name)
                 )
+                continue
+
+            row = self.get_receive_row(match.row_index)
+            action = parse_receive_action(row, match.name)
+            if self._run_receive_action(match, action):
+                self._append_comm_line(
+                    'Communication stopped by receive sequence "{}".'.format(
+                        match.name
+                    )
+                )
+                self.routes.stop_communication()
+                break
+
+    def _run_receive_action(self, match, action: ReceiveActionConfig) -> bool:
+        if action.action_type == "Comment":
+            comment = action.comment_text.strip() or default_comment_text(match.name)
+            self._append_comm_comment(
+                comment,
+                include_timestamp=action.comment_timestamp,
+                extra_line_break=action.comment_line_break,
+            )
+            return False
+
+        if action.action_type == "Trigger" and action.snapshot_trigger:
+            self._append_comm_line(
+                'Snapshot triggered by receive sequence "{}".'.format(match.name)
+            )
+            return False
+
+        if action.action_type == "Stop" and action.stop_communication:
+            return True
+
+        if action.action_type == "Answer":
+            self._send_answer_sequence(action.answer_send_index, match.name)
+
+        return False
+
+    def _send_answer_sequence(self, send_index, trigger_name=""):
+        if not self.comm_service.is_connected():
+            return
+
+        if not (0 <= send_index < len(self._send_rows)):
+            self._append_comm_line(
+                'Automatic answer for "{}" failed: invalid send sequence.'.format(
+                    trigger_name
+                )
+            )
+            return
+
+        send_row = self.get_send_row(send_index)
+        name = send_row[1]
+        sequence = send_row[2]
+        checksum_rule = send_row[4]
+
+        for token in sequence.split():
+            if PLACEHOLDER_PATTERN.match(token):
+                self._append_comm_line(
+                    'Automatic answer for "{}" failed: send sequence "{}" '
+                    "contains wildcards.".format(trigger_name, name)
+                )
+                return
+
+        try:
+            payload = encode_sequence(sequence)
+            payload = append_checksum(payload, checksum_rule)
+        except (SequenceEncodeError, ChecksumError) as exc:
+            self._append_comm_line(
+                'Automatic answer for "{}" failed: {}'.format(trigger_name, exc)
+            )
+            return
+
+        try:
+            self.comm_service.send_bytes(payload, label=name)
+        except Exception as exc:
+            self._append_comm_line(
+                'Automatic answer for "{}" failed: {}'.format(trigger_name, exc)
+            )
 
     def apply_project_settings(self, settings):
         was_open = self.comm_service.is_connected()
@@ -286,8 +414,7 @@ class HomePage(tk.Tk):
             ("", "Pong", "50 6F 6E 67", False, DEFAULT_CHECKSUM, "HEX"),
         ]
         for row in self._send_rows:
-            normalized = self._normalize_send_row(row)
-            self.send_tree.insert("", tk.END, values=normalized[:3])
+            self.send_tree.insert("", tk.END, values=self._send_row_display_values(row))
 
         def on_yscroll(*args):
             scrollbar.set(*args)
@@ -342,37 +469,168 @@ class HomePage(tk.Tk):
 
         row_index = self.send_tree.index(row_id)
         send_row = self.get_send_row(row_index)
+        if send_row[3] and send_row[6] > 0:
+            self._start_repeat_for_row(row_index, send_immediately=True)
+            return
+
+        self._stop_repeat_for_row(row_index)
+        self._send_sequence_by_index(row_index)
+
+    def _send_sequence_by_index(self, row_index, from_repeat=False):
+        if not self.comm_service.is_connected():
+            return False
+        if not (0 <= row_index < len(self._send_rows)):
+            return False
+
+        send_row = self.get_send_row(row_index)
         name = send_row[1]
         sequence = send_row[2]
-        periodic = send_row[3]
         checksum_rule = send_row[4]
-
-        if periodic:
-            return
 
         try:
             payload = encode_sequence(sequence)
             payload = append_checksum(payload, checksum_rule)
         except (SequenceEncodeError, ChecksumError) as exc:
-            messagebox.showerror(
-                "Send Sequence",
-                "Could not encode sequence:\n{}".format(exc),
-                parent=self,
-            )
-            return
+            if from_repeat:
+                self._append_comm_line(
+                    'Periodic send for "{}" failed: {}'.format(name, exc)
+                )
+            else:
+                messagebox.showerror(
+                    "Send Sequence",
+                    "Could not encode sequence:\n{}".format(exc),
+                    parent=self,
+                )
+            return False
 
         try:
             self.comm_service.send_bytes(payload, label=name)
         except Exception as exc:
-            messagebox.showerror(
-                "Send Sequence",
-                "Could not send sequence:\n{}".format(exc),
-                parent=self,
-            )
+            if from_repeat:
+                self._append_comm_line(
+                    'Periodic send for "{}" failed: {}'.format(name, exc)
+                )
+            else:
+                messagebox.showerror(
+                    "Send Sequence",
+                    "Could not send sequence:\n{}".format(exc),
+                    parent=self,
+                )
+            return False
+
+        return True
+
+    def _stop_repeat_for_row(self, row_index):
+        after_id = self._repeat_after_ids.pop(row_index, None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
+    def _start_repeat_for_row(self, row_index, send_immediately=False):
+        self._stop_repeat_for_row(row_index)
+
+        if not self.comm_service.is_connected():
+            return
+
+        send_row = self.get_send_row(row_index)
+        if not send_row[3] or send_row[6] <= 0:
+            if send_immediately:
+                self._send_sequence_by_index(row_index)
+            return
+
+        if send_immediately and not self._send_sequence_by_index(row_index):
+            return
+
+        interval_ms = max(100, int(send_row[6] * 1000))
+        after_id = self.after(
+            interval_ms,
+            lambda: self._tick_repeat_send(row_index, interval_ms),
+        )
+        self._repeat_after_ids[row_index] = after_id
+
+    def stop_repeat_senders(self):
+        for after_id in self._repeat_after_ids.values():
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._repeat_after_ids.clear()
+
+    def _tick_repeat_send(self, row_index, interval_ms):
+        self._repeat_after_ids.pop(row_index, None)
+        if not self.comm_service.is_connected():
+            return
+
+        if not (0 <= row_index < len(self._send_rows)):
+            return
+
+        send_row = self.get_send_row(row_index)
+        if not send_row[3] or send_row[6] <= 0:
+            return
+
+        self._send_sequence_by_index(row_index, from_repeat=True)
+
+        if not self.comm_service.is_connected():
+            return
+
+        after_id = self.after(
+            interval_ms,
+            lambda: self._tick_repeat_send(row_index, interval_ms),
+        )
+        self._repeat_after_ids[row_index] = after_id
+
+    def get_display_mode(self):
+        return self._global_display_mode
+
+    def apply_global_display_mode(self, mode):
+        if mode not in ("ASCII", "HEX", "Decimal", "Binary"):
+            return
+        if self._updating_display_mode:
+            return
+
+        self._updating_display_mode = True
+        try:
+            self._global_display_mode = mode
+
+            for index, row in enumerate(self._send_rows):
+                normalized = list(self._normalize_send_row(row))
+                normalized[5] = mode
+                self._send_rows[index] = tuple(normalized)
+
+            for index, row in enumerate(self._receive_rows):
+                normalized = list(self._normalize_receive_row(row))
+                normalized[5] = mode
+                self._receive_rows[index] = tuple(normalized)
+
+            self._refresh_send_tree()
+            self._refresh_receive_tree()
+
+            if hasattr(self, "_comm_notebook"):
+                modes = ("ASCII", "HEX", "Decimal", "Binary")
+                selected = self._comm_notebook.index(self._comm_notebook.select())
+                if modes[selected] != mode:
+                    self._comm_notebook.select(modes.index(mode))
+
+            dialog = getattr(self.routes, "_open_dialog", None)
+            if (
+                dialog is not None
+                and dialog.winfo_exists()
+                and hasattr(dialog, "update_display_mode_from_global")
+            ):
+                dialog.update_display_mode_from_global(mode)
+        finally:
+            self._updating_display_mode = False
+
+    def _on_comm_tab_changed(self, _event):
+        modes = ("ASCII", "HEX", "Decimal", "Binary")
+        selected = self._comm_notebook.index(self._comm_notebook.select())
+        self.apply_global_display_mode(modes[selected])
 
     def get_send_row(self, index):
         if not (0 <= index < len(self._send_rows)):
-            return ("", "", "", False, DEFAULT_CHECKSUM, "HEX")
+            return ("", "", "", False, DEFAULT_CHECKSUM, "HEX", 0.0)
         return self._normalize_send_row(self._send_rows[index])
 
     def _normalize_send_row(self, row):
@@ -382,7 +640,21 @@ class HomePage(tk.Tk):
         periodic = row[3] if len(row) > 3 else False
         checksum = row[4] if len(row) > 4 else DEFAULT_CHECKSUM
         display_mode = row[5] if len(row) > 5 else "HEX"
-        return (send, name, sequence, periodic, checksum, display_mode)
+        repeat_interval = row[6] if len(row) > 6 else 0.0
+        try:
+            repeat_interval = float(repeat_interval)
+        except (TypeError, ValueError):
+            repeat_interval = 0.0
+        repeat_interval = max(0.0, repeat_interval)
+        return (
+            send,
+            name,
+            sequence,
+            periodic,
+            checksum,
+            display_mode,
+            repeat_interval,
+        )
 
     def _send_row_display_values(self, row):
         normalized = self._normalize_send_row(row)
@@ -405,7 +677,16 @@ class HomePage(tk.Tk):
         periodic=False,
         checksum=None,
         display_mode="HEX",
+        repeat_interval=0.0,
     ):
+        try:
+            repeat_interval = max(0.0, float(repeat_interval))
+        except (TypeError, ValueError):
+            repeat_interval = 0.0
+
+        was_repeating = old_index in self._repeat_after_ids
+        self._stop_repeat_for_row(old_index)
+
         row_data = (
             "",
             name,
@@ -413,6 +694,7 @@ class HomePage(tk.Tk):
             periodic,
             checksum or DEFAULT_CHECKSUM,
             display_mode,
+            repeat_interval,
         )
         rows = self._send_rows
         if not (0 <= old_index < len(rows)):
@@ -422,9 +704,17 @@ class HomePage(tk.Tk):
         new_index = max(0, min(new_index, len(rows)))
         rows.insert(new_index, row_data)
         self._refresh_send_tree()
+        if (
+            was_repeating
+            and periodic
+            and repeat_interval > 0
+            and self.comm_service.is_connected()
+        ):
+            self._start_repeat_for_row(new_index, send_immediately=False)
 
     def delete_send_sequence(self, index):
         if 0 <= index < len(self._send_rows):
+            self.stop_repeat_senders()
             self._send_rows.pop(index)
             self._refresh_send_tree()
 
@@ -440,7 +730,16 @@ class HomePage(tk.Tk):
         checksum = row[3] if len(row) > 3 else DEFAULT_CHECKSUM
         checksum_detect = row[4] if len(row) > 4 else DEFAULT_CHECKSUM_DETECT
         display_mode = row[5] if len(row) > 5 else "HEX"
-        return (active, name, sequence, checksum, checksum_detect, display_mode)
+        action = parse_receive_action(row, name)
+        return (
+            active,
+            name,
+            sequence,
+            checksum,
+            checksum_detect,
+            display_mode,
+            *receive_action_fields(action),
+        )
 
     def _receive_row_display_values(self, row):
         normalized = self._normalize_receive_row(row)
@@ -462,6 +761,7 @@ class HomePage(tk.Tk):
         checksum=None,
         checksum_detect=None,
         display_mode="HEX",
+        action=None,
     ):
         rows = self._receive_rows
         if not (0 <= old_index < len(rows)):
@@ -473,7 +773,17 @@ class HomePage(tk.Tk):
             checksum = old_row[3]
         if checksum_detect is None:
             checksum_detect = old_row[4]
-        row_data = (active, name, sequence, checksum, checksum_detect, display_mode)
+        if action is None:
+            action = parse_receive_action(old_row, name)
+        row_data = (
+            active,
+            name,
+            sequence,
+            checksum,
+            checksum_detect,
+            display_mode,
+            *receive_action_fields(action),
+        )
         rows.pop(old_index)
         new_index = max(0, min(new_index, len(rows)))
         rows.insert(new_index, row_data)
@@ -514,12 +824,54 @@ class HomePage(tk.Tk):
         self.receive_tree.column("sequence", width=200, anchor=tk.W)
 
         self._receive_rows = [
-            ("☑", "ACK", "<ACK>", DEFAULT_CHECKSUM, DEFAULT_CHECKSUM_DETECT, "HEX"),
-            ("☑", "Ping received", "2D 2D 2D 2D", DEFAULT_CHECKSUM, DEFAULT_CHECKSUM_DETECT, "HEX"),
-            ("☐", "Pong received", "50 6F 6E 67", DEFAULT_CHECKSUM, DEFAULT_CHECKSUM_DETECT, "HEX"),
+            (
+                "☑",
+                "ACK",
+                "<ACK>",
+                DEFAULT_CHECKSUM,
+                DEFAULT_CHECKSUM_DETECT,
+                "HEX",
+                "Comment",
+                0,
+                default_comment_text("ACK"),
+                True,
+                True,
+                True,
+                False,
+            ),
+            (
+                "☑",
+                "Ping received",
+                "2D 2D 2D 2D",
+                DEFAULT_CHECKSUM,
+                DEFAULT_CHECKSUM_DETECT,
+                "HEX",
+                "Stop",
+                0,
+                default_comment_text("Ping received"),
+                True,
+                True,
+                True,
+                True,
+            ),
+            (
+                "☐",
+                "Pong received",
+                "50 6F 6E 67",
+                DEFAULT_CHECKSUM,
+                DEFAULT_CHECKSUM_DETECT,
+                "HEX",
+                "Answer",
+                2,
+                default_comment_text("Pong received"),
+                True,
+                True,
+                True,
+                False,
+            ),
         ]
         for row in self._receive_rows:
-            self.receive_tree.insert("", tk.END, values=row)
+            self.receive_tree.insert("", tk.END, values=self._receive_row_display_values(row))
 
         scrollbar = ttk.Scrollbar(
             table_frame, orient=tk.VERTICAL, command=self.receive_tree.yview
@@ -551,6 +903,7 @@ class HomePage(tk.Tk):
         ).pack(side=tk.RIGHT, padx=(0, 8))
 
         notebook = ttk.Notebook(frame)
+        self._comm_notebook = notebook
         notebook.pack(fill=tk.BOTH, expand=True)
 
         for tab_name in ("ASCII", "HEX", "Decimal", "Binary"):
@@ -573,7 +926,8 @@ class HomePage(tk.Tk):
             scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
             self._comm_texts[tab_name] = text
 
-        notebook.select(0)
+        notebook.bind("<<NotebookTabChanged>>", self._on_comm_tab_changed)
+        notebook.select(1)
         return frame
 
 

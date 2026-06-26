@@ -3,10 +3,12 @@
 import tkinter.messagebox as messagebox
 
 from core.checksum_rules import DEFAULT_CHECKSUM
-from ui.edit_receive_sequence import (
-    DEFAULT_CHECKSUM_DETECT,
-    EditReceiveSequence,
+from core.receive_actions import (
+    ReceiveActionConfig,
+    parse_receive_action,
+    receive_action_fields,
 )
+from ui.edit_receive_sequence import DEFAULT_CHECKSUM_DETECT, EditReceiveSequence
 from ui.edit_send_request import EditSendRequest
 from ui.project_setting import ProjectSetting
 
@@ -68,6 +70,7 @@ class Routes:
         self.home.port_status.set("Communication port {} open".format(port))
 
     def stop_communication(self):
+        self.home.stop_repeat_senders()
         self.home.comm_service.disconnect()
         self.home._communication_open = False
         self.home.port_status.set("Communication port closed")
@@ -88,15 +91,24 @@ class Routes:
                 sequence=send_row[2],
                 row_count=row_count,
                 periodic=send_row[3],
+                repeat_interval=send_row[6],
                 checksum=send_row[4],
-                display_mode=send_row[5],
+                display_mode=self.home.get_display_mode(),
             )
 
         self.show_dialog(create_dialog)
 
     def add_send_sequence(self):
         self.home._send_rows.append(
-            ("", "New Sequence", "", False, DEFAULT_CHECKSUM, "HEX")
+            (
+                "",
+                "New Sequence",
+                "",
+                False,
+                DEFAULT_CHECKSUM,
+                self.home.get_display_mode(),
+                0.0,
+            )
         )
         self.home._refresh_send_tree()
         self.open_send_sequence_editor(len(self.home._send_rows) - 1)
@@ -107,6 +119,7 @@ class Routes:
 
         row_count = len(self.home._receive_rows)
         row = self.home.get_receive_row(row_index)
+        action = parse_receive_action(row, row[1])
 
         def create_dialog():
             return EditReceiveSequence(
@@ -118,14 +131,24 @@ class Routes:
                 row_count=row_count,
                 checksum=row[3],
                 checksum_detect=row[4],
-                display_mode=row[5],
+                display_mode=self.home.get_display_mode(),
+                action=action,
             )
 
         self.show_dialog(create_dialog)
 
     def add_receive_sequence(self):
+        default_action = ReceiveActionConfig()
         self.home._receive_rows.append(
-            ("☐", "New Sequence", "", DEFAULT_CHECKSUM, DEFAULT_CHECKSUM_DETECT, "HEX")
+            (
+                "☐",
+                "New Sequence",
+                "",
+                DEFAULT_CHECKSUM,
+                DEFAULT_CHECKSUM_DETECT,
+                self.home.get_display_mode(),
+                *receive_action_fields(default_action),
+            )
         )
         self.home._refresh_receive_tree()
         self.open_receive_sequence_editor(len(self.home._receive_rows) - 1)
