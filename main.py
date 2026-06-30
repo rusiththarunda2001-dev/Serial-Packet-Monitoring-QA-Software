@@ -27,6 +27,8 @@ def main():
         print("Run this file from the project folder:", Path(__file__).resolve().parent, file=sys.stderr)
         sys.exit(1)
 
+    project_path = sys.argv[1] if len(sys.argv) > 1 else None
+
     try:
         app = HomePage()
     except Exception as exc:
@@ -35,6 +37,18 @@ def main():
         print("Try running with the project virtual environment:", file=sys.stderr)
         print("  .venv\\Scripts\\python.exe main.py", file=sys.stderr)
         sys.exit(1)
+
+    if project_path:
+        try:
+            app.load_project_from_path(project_path)
+        except Exception as exc:
+            from core.project_file import ProjectFileError
+
+            if isinstance(exc, ProjectFileError):
+                print("Could not open project file:", exc, file=sys.stderr)
+            else:
+                print("Could not open project file:", exc, file=sys.stderr)
+            sys.exit(1)
 
     app.mainloop()
 

@@ -1,8 +1,14 @@
 """Application UI routing between Docklight screens."""
 
 import tkinter.messagebox as messagebox
+from tkinter import filedialog
 
 from core.checksum_rules import DEFAULT_CHECKSUM
+from core.project_file import (
+    PROJECT_FILE_EXTENSION,
+    PROJECT_FILE_TYPES,
+    ProjectFileError,
+)
 from core.receive_actions import (
     ReceiveActionConfig,
     parse_receive_action,
@@ -43,6 +49,64 @@ class Routes:
             return ProjectSetting(self.home)
 
         self.show_dialog(create_dialog)
+
+    def new_project(self):
+        if not self.home.confirm_discard_unsaved_changes():
+            return
+
+        self.home.reset_project_state()
+        self.home.mark_project_clean(path=None)
+
+    def open_project(self):
+        if not self.home.confirm_discard_unsaved_changes():
+            return
+
+        path = filedialog.askopenfilename(
+            parent=self.home,
+            title="Open Project",
+            filetypes=PROJECT_FILE_TYPES,
+        )
+        if not path:
+            return
+
+        try:
+            self.home.load_project_from_path(path)
+        except ProjectFileError as exc:
+            messagebox.showerror("Open Project", str(exc), parent=self.home)
+
+    def save_project(self):
+        path = self.home.get_project_path()
+        if not path:
+            return self.save_project_as()
+
+        try:
+            self.home.save_project_to_path(path)
+        except ProjectFileError as exc:
+            messagebox.showerror("Save Project", str(exc), parent=self.home)
+            return False
+        return True
+
+    def save_project_as(self):
+        initial = self.home.get_project_path()
+        if not initial:
+            initial = "Untitled{}".format(PROJECT_FILE_EXTENSION)
+
+        path = filedialog.asksaveasfilename(
+            parent=self.home,
+            title="Save Project As",
+            defaultextension=PROJECT_FILE_EXTENSION,
+            initialfile=initial,
+            filetypes=PROJECT_FILE_TYPES,
+        )
+        if not path:
+            return False
+
+        try:
+            self.home.save_project_to_path(path)
+        except ProjectFileError as exc:
+            messagebox.showerror("Save Project", str(exc), parent=self.home)
+            return False
+        return True
 
     def start_communication(self):
         if self.home.comm_service.is_connected():
@@ -111,6 +175,7 @@ class Routes:
             )
         )
         self.home._refresh_send_tree()
+        self.home.mark_project_dirty()
         self.open_send_sequence_editor(len(self.home._send_rows) - 1)
 
     def open_receive_sequence_editor(self, row_index):
@@ -151,6 +216,7 @@ class Routes:
             )
         )
         self.home._refresh_receive_tree()
+        self.home.mark_project_dirty()
         self.open_receive_sequence_editor(len(self.home._receive_rows) - 1)
 
     def on_send_row_click(self, event):
@@ -190,6 +256,7 @@ class Routes:
             row = list(self.home.get_receive_row(row_index))
             row[0] = values[0]
             self.home._receive_rows[row_index] = tuple(row)
+            self.home.mark_project_dirty()
 
 
 if __name__ == "__main__":

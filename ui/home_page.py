@@ -1,9 +1,10 @@
 """Docklight home page UI."""
 
 from datetime import datetime
+from pathlib import Path
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from core.checksum import ChecksumError, append_checksum
 from core.comm_display import (
@@ -16,10 +17,16 @@ from core.checksum_rules import DEFAULT_CHECKSUM
 from core.receive_actions import (
     ReceiveActionConfig,
     default_comment_text,
+    format_answer_display,
     parse_receive_action,
     receive_action_fields,
 )
-from core.receive_matcher import find_matches
+from core.project_file import (
+    ProjectFileError,
+    apply_project_document,
+    load_project_file,
+    save_project_file,
+)
 from core.sequence_codec import (
     PLACEHOLDER_PATTERN,
     SequenceEncodeError,
@@ -35,8 +42,8 @@ class HomePage(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("EC Docklight V2.3")
-        self.geometry("1100x650")
-        self.minsize(900, 550)
+        self.geometry("1100x750")
+        self.minsize(900, 650)
         self.configure(bg="#d9d9d9")
 
         self._send_rows = []
@@ -45,6 +52,8 @@ class HomePage(tk.Tk):
         self._repeat_after_ids = {}
         self._global_display_mode = "HEX"
         self._updating_display_mode = False
+        self._project_path = None
+        self._project_dirty = False
         self.project_settings = ProjectSettings()
         self._communication_open = False
         self._comm_texts = {}
@@ -58,15 +67,93 @@ class HomePage(tk.Tk):
         self.routes.bind()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after_idle(self._refresh_send_buttons)
+        self._update_window_title()
 
     def _build_menu(self):
         menubar = tk.Menu(self)
         self.config(menu=menubar)
 
-        for label in ("File", "Edit", "Run", "Tools", "Scripting", "Help"):
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="New Project...", command=self.routes.new_project)
+        file_menu.add_command(label="Open Project...", command=self.routes.open_project)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save Project", command=self.routes.save_project)
+        file_menu.add_command(
+            label="Save Project As...", command=self.routes.save_project_as
+        )
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self._file_menu = file_menu
+
+        for label in ("Edit", "Run", "Tools", "Scripting", "Help"):
             menu = tk.Menu(menubar, tearoff=0)
             menu.add_command(label="{} item".format(label))
             menubar.add_cascade(label=label, menu=menu)
+
+    def get_project_path(self):
+        return self._project_path
+
+    def is_project_dirty(self):
+        return self._project_dirty
+
+    def mark_project_dirty(self):
+        if self._project_dirty:
+            return
+        self._project_dirty = True
+        self._update_window_title()
+
+    def mark_project_clean(self, path=None):
+        if path is not None:
+            self._project_path = path
+        self._project_dirty = False
+        self._update_window_title()
+
+    def _update_window_title(self):
+        base_title = "EC Docklight V2.3"
+        if self._project_path:
+            name = Path(self._project_path).name
+        else:
+            name = "Untitled"
+        dirty_marker = "*" if self._project_dirty else ""
+        self.title("{} - {}{}".format(base_title, name, dirty_marker))
+
+    def reset_project_state(self):
+        self.stop_repeat_senders()
+        self.project_settings = ProjectSettings()
+        self._send_rows = []
+        self._receive_rows = []
+        self._global_display_mode = "HEX"
+        self.com_port.set(self.project_settings.get("channel"))
+        self._refresh_send_tree()
+        self._refresh_receive_tree()
+        if hasattr(self, "_comm_notebook"):
+            self._comm_notebook.select(1)
+        self._clear_communication_panel()
+
+    def load_project_from_path(self, path):
+        document = load_project_file(path)
+        apply_project_document(self, document)
+        self.mark_project_clean(path=path)
+
+    def save_project_to_path(self, path):
+        save_project_file(path, self)
+        self.mark_project_clean(path=path)
+
+    def confirm_discard_unsaved_changes(self):
+        if not self._project_dirty:
+            return True
+
+        answer = messagebox.askyesnocancel(
+            "Unsaved Changes",
+            "Save changes to the current project before continuing?",
+            parent=self,
+        )
+        if answer is None:
+            return False
+        if answer:
+            return self.routes.save_project()
+        return True
 
     def _build_toolbar(self):
         toolbar = tk.Frame(self, bg="#d4d0c8", relief=tk.RAISED, bd=1)
@@ -146,6 +233,8 @@ class HomePage(tk.Tk):
         ).pack(side=tk.LEFT)
 
     def _on_close(self):
+        if not self.confirm_discard_unsaved_changes():
+            return
         self.stop_repeat_senders()
         self.comm_service.disconnect()
         self.destroy()
@@ -160,7 +249,13 @@ class HomePage(tk.Tk):
             matches = find_matches(
                 event.data, self._receive_rows, self._normalize_receive_row
             )
-            self._append_comm_data(event.data, "RX")
+            inline_suffix, extra_line_break = self._get_rx_inline_suffix(matches)
+            self._append_comm_data(
+                event.data,
+                "RX",
+                inline_suffix=inline_suffix,
+                extra_line_break=extra_line_break,
+            )
             self._handle_receive_matches(matches)
         elif isinstance(event, ErrorEvent):
             self._append_comm_line("[ERR] {}".format(event.message), tag="error", direction="RX")
@@ -209,7 +304,32 @@ class HomePage(tk.Tk):
             text_widget.insert(tk.END, "\n")
             text_widget.see(tk.END)
 
-    def _append_comm_data(self, data, direction, label=""):
+    def _get_rx_inline_suffix(self, matches):
+        """Comment text appended on the matched RX data line (all action types)."""
+        for match in matches:
+            if match.checksum_ok is False:
+                continue
+
+            row = self.get_receive_row(match.row_index)
+            action = parse_receive_action(row, match.name)
+            comment = action.comment_text.strip() or default_comment_text(match.name)
+            if not comment:
+                continue
+
+            if action.comment_timestamp:
+                comment = "{}  {}".format(comment, self._format_comm_timestamp())
+
+            return comment, action.comment_line_break
+
+        return "", False
+
+    def _append_comm_data(
+        self,
+        data,
+        direction,
+        inline_suffix="",
+        extra_line_break=False,
+    ):
         if not self._comm_texts:
             return
 
@@ -218,6 +338,7 @@ class HomePage(tk.Tk):
             lines = [(data, b"")]
 
         data_tag = "rx_data" if direction == "RX" else "tx_data"
+        last_line_index = len(lines) - 1
 
         for tab_name, text_widget in self._comm_texts.items():
             for index, (line_bytes, ending) in enumerate(lines):
@@ -227,27 +348,14 @@ class HomePage(tk.Tk):
                 self._insert_comm_payload(text_widget, line_bytes, tab_name, data_tag)
                 self._insert_comm_line_ending(text_widget, ending)
 
-                if label and index == 0:
-                    text_widget.insert(tk.END, "  {}".format(label), "meta")
+                if inline_suffix and index == last_line_index:
+                    text_widget.insert(tk.END, "  {}".format(inline_suffix), "meta")
 
                 text_widget.insert(tk.END, "\n")
 
-            text_widget.see(tk.END)
-
-    def _append_comm_comment(self, text, include_timestamp=False, extra_line_break=False):
-        if not self._comm_texts or not text:
-            return
-
-        line = text
-        if include_timestamp:
-            line = "{}  {}".format(line, self._format_comm_timestamp())
-
-        for text_widget in self._comm_texts.values():
-            self._insert_comm_header(text_widget, "RX")
-            text_widget.insert(tk.END, line, "meta")
-            text_widget.insert(tk.END, "\n")
-            if extra_line_break:
+            if extra_line_break and inline_suffix:
                 text_widget.insert(tk.END, "\n")
+
             text_widget.see(tk.END)
 
     def _handle_receive_matches(self, matches):
@@ -271,12 +379,11 @@ class HomePage(tk.Tk):
 
     def _run_receive_action(self, match, action: ReceiveActionConfig) -> bool:
         if action.action_type == "Comment":
-            comment = action.comment_text.strip() or default_comment_text(match.name)
-            self._append_comm_comment(
-                comment,
-                include_timestamp=action.comment_timestamp,
-                extra_line_break=action.comment_line_break,
-            )
+            return False
+
+        if action.action_type == "Answer":
+            if action.answer_send_index >= 0:
+                self._send_answer_sequence(action.answer_send_index, match.name)
             return False
 
         if action.action_type == "Trigger" and action.snapshot_trigger:
@@ -287,9 +394,6 @@ class HomePage(tk.Tk):
 
         if action.action_type == "Stop" and action.stop_communication:
             return True
-
-        if action.action_type == "Answer":
-            self._send_answer_sequence(action.answer_send_index, match.name)
 
         return False
 
@@ -341,6 +445,7 @@ class HomePage(tk.Tk):
 
         self.project_settings.update(settings)
         self.com_port.set(self.project_settings.get("channel"))
+        self.mark_project_dirty()
 
         if was_open:
             self.routes.start_communication()
@@ -376,8 +481,42 @@ class HomePage(tk.Tk):
         left_pane.add(send_frame, weight=1)
         left_pane.add(receive_frame, weight=1)
 
+        right_pane = ttk.PanedWindow(paned, orient=tk.VERTICAL)
+        paned.add(right_pane, weight=2)
+
         comm_frame = self._build_communication_panel()
-        paned.add(comm_frame, weight=2)
+        script_frame = self._build_script_editor_panel()
+        right_pane.add(comm_frame, weight=3)
+        right_pane.add(script_frame, weight=1)
+
+    def _build_script_editor_panel(self):
+        frame = ttk.LabelFrame(self, text="", padding=4)
+
+        tk.Label(
+            frame,
+            text="Script Editor",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor=tk.W, pady=(0, 4))
+
+        body = tk.Frame(frame, bg="white", relief=tk.SUNKEN, bd=1)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        self._script_text = tk.Text(
+            body,
+            bg="white",
+            relief=tk.FLAT,
+            borderwidth=0,
+            wrap=tk.NONE,
+            font=("Consolas", 10),
+            padx=4,
+            pady=4,
+        )
+        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self._script_text.yview)
+        self._script_text.configure(yscrollcommand=scrollbar.set)
+        self._script_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        return frame
 
     def _build_send_sequences(self):
         frame = ttk.LabelFrame(self, text="", padding=4)
@@ -408,11 +547,7 @@ class HomePage(tk.Tk):
         self.send_tree.column("name", width=120, anchor=tk.W)
         self.send_tree.column("sequence", width=200, anchor=tk.W)
 
-        self._send_rows = [
-            ("", "TestData", "7 8 9 4 5", False, DEFAULT_CHECKSUM, "HEX"),
-            ("", "Ping", "2D 2D 2D 2D", False, DEFAULT_CHECKSUM, "HEX"),
-            ("", "Pong", "50 6F 6E 67", False, DEFAULT_CHECKSUM, "HEX"),
-        ]
+        self._send_rows = []
         for row in self._send_rows:
             self.send_tree.insert("", tk.END, values=self._send_row_display_values(row))
 
@@ -622,6 +757,7 @@ class HomePage(tk.Tk):
                 dialog.update_display_mode_from_global(mode)
         finally:
             self._updating_display_mode = False
+        self.mark_project_dirty()
 
     def _on_comm_tab_changed(self, _event):
         modes = ("ASCII", "HEX", "Decimal", "Binary")
@@ -704,6 +840,8 @@ class HomePage(tk.Tk):
         new_index = max(0, min(new_index, len(rows)))
         rows.insert(new_index, row_data)
         self._refresh_send_tree()
+        self._refresh_receive_tree()
+        self.mark_project_dirty()
         if (
             was_repeating
             and periodic
@@ -717,6 +855,8 @@ class HomePage(tk.Tk):
             self.stop_repeat_senders()
             self._send_rows.pop(index)
             self._refresh_send_tree()
+            self._refresh_receive_tree()
+            self.mark_project_dirty()
 
     def get_receive_row(self, index):
         if not (0 <= index < len(self._receive_rows)):
@@ -744,7 +884,11 @@ class HomePage(tk.Tk):
     def _receive_row_display_values(self, row):
         normalized = self._normalize_receive_row(row)
         sequence_display = format_sequence_display(normalized[2], normalized[5])
-        return (normalized[0], normalized[1], sequence_display)
+        action = parse_receive_action(normalized, normalized[1])
+        answer_display = format_answer_display(
+            action, self._send_rows, self._normalize_send_row
+        )
+        return (normalized[0], normalized[1], sequence_display, answer_display)
 
     def _refresh_receive_tree(self):
         for item in self.receive_tree.get_children():
@@ -788,11 +932,13 @@ class HomePage(tk.Tk):
         new_index = max(0, min(new_index, len(rows)))
         rows.insert(new_index, row_data)
         self._refresh_receive_tree()
+        self.mark_project_dirty()
 
     def delete_receive_sequence(self, index):
         if 0 <= index < len(self._receive_rows):
             self._receive_rows.pop(index)
             self._refresh_receive_tree()
+            self.mark_project_dirty()
 
     def _build_receive_sequences(self):
         frame = ttk.LabelFrame(self, text="", padding=4)
@@ -812,64 +958,20 @@ class HomePage(tk.Tk):
         table_frame = tk.Frame(frame)
         table_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("active", "name", "sequence")
+        columns = ("active", "name", "sequence", "answer")
         self.receive_tree = ttk.Treeview(
             table_frame, columns=columns, show="headings", height=8
         )
         self.receive_tree.heading("active", text="Active")
         self.receive_tree.heading("name", text="Name")
         self.receive_tree.heading("sequence", text="Sequence")
+        self.receive_tree.heading("answer", text="Answer")
         self.receive_tree.column("active", width=50, anchor=tk.CENTER)
-        self.receive_tree.column("name", width=120, anchor=tk.W)
-        self.receive_tree.column("sequence", width=200, anchor=tk.W)
+        self.receive_tree.column("name", width=100, anchor=tk.W)
+        self.receive_tree.column("sequence", width=140, anchor=tk.W)
+        self.receive_tree.column("answer", width=100, anchor=tk.W)
 
-        self._receive_rows = [
-            (
-                "☑",
-                "ACK",
-                "<ACK>",
-                DEFAULT_CHECKSUM,
-                DEFAULT_CHECKSUM_DETECT,
-                "HEX",
-                "Comment",
-                0,
-                default_comment_text("ACK"),
-                True,
-                True,
-                True,
-                False,
-            ),
-            (
-                "☑",
-                "Ping received",
-                "2D 2D 2D 2D",
-                DEFAULT_CHECKSUM,
-                DEFAULT_CHECKSUM_DETECT,
-                "HEX",
-                "Stop",
-                0,
-                default_comment_text("Ping received"),
-                True,
-                True,
-                True,
-                True,
-            ),
-            (
-                "☐",
-                "Pong received",
-                "50 6F 6E 67",
-                DEFAULT_CHECKSUM,
-                DEFAULT_CHECKSUM_DETECT,
-                "HEX",
-                "Answer",
-                2,
-                default_comment_text("Pong received"),
-                True,
-                True,
-                True,
-                False,
-            ),
-        ]
+        self._receive_rows = []
         for row in self._receive_rows:
             self.receive_tree.insert("", tk.END, values=self._receive_row_display_values(row))
 
