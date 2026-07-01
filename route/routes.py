@@ -134,10 +134,34 @@ class Routes:
         self.home.port_status.set("Communication port {} open".format(port))
 
     def stop_communication(self):
+        self.home.set_keyboard_console_enabled(False)
         self.home.stop_repeat_senders()
         self.home.comm_service.disconnect()
         self.home._communication_open = False
         self.home.port_status.set("Communication port closed")
+
+    def toggle_keyboard_console(self):
+        if self.home._keyboard_console_enabled:
+            self.home.set_keyboard_console_enabled(False)
+            return
+
+        if self.home.project_settings.get("comm_mode") != "send_receive":
+            messagebox.showwarning(
+                "Keyboard Console",
+                "The keyboard console is only available in Send/Receive mode.",
+                parent=self.home,
+            )
+            return
+
+        if not self.home.comm_service.is_connected():
+            messagebox.showwarning(
+                "Keyboard Console",
+                "Start communication before using the keyboard console.",
+                parent=self.home,
+            )
+            return
+
+        self.home.set_keyboard_console_enabled(True)
 
     def open_send_sequence_editor(self, row_index):
         if not (0 <= row_index < len(self.home._send_rows)):

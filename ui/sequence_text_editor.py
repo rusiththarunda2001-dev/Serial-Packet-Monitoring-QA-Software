@@ -127,6 +127,9 @@ class SequenceTextEditor(tk.Frame):
         return None
 
     def _display_part_to_token(self, part, mode):
+        # A lone space is a valid ASCII cell (byte 0x20); strip() would erase it.
+        if mode == "ASCII" and part == " ":
+            return "{:02X}".format(32)
         part = part.strip()
         if not part:
             return None
@@ -170,12 +173,14 @@ class SequenceTextEditor(tk.Frame):
         return "{:02X}".format(byte_val)
 
     def _sync_tokens_from_text(self):
-        content = self.seq_text.get("1.0", tk.END).strip()
+        content = self.seq_text.get("1.0", tk.END)
+        if content.endswith("\n"):
+            content = content[:-1]
         if not content:
             self._tokens = []
             return
 
-        parts = [part.strip() for part in content.split(CELL_SEP) if part.strip()]
+        parts = [part.strip() if part != " " else part for part in content.split(CELL_SEP) if part != ""]
         tokens = []
         for part in parts:
             token = self._display_part_to_token(part, self._prev_mode)

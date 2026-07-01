@@ -27,6 +27,7 @@ from core.project_file import (
     load_project_file,
     save_project_file,
 )
+from core.receive_matcher import find_matches
 from core.sequence_codec import (
     PLACEHOLDER_PATTERN,
     SequenceEncodeError,
@@ -56,6 +57,8 @@ class HomePage(tk.Tk):
         self._project_dirty = False
         self.project_settings = ProjectSettings()
         self._communication_open = False
+        self._keyboard_console_enabled = False
+        self._keyboard_console_canvas = None
         self._comm_texts = {}
         self.comm_service = CommService(self._on_comm_event)
         self.routes = Routes(self)
@@ -119,6 +122,7 @@ class HomePage(tk.Tk):
         self.title("{} - {}{}".format(base_title, name, dirty_marker))
 
     def reset_project_state(self):
+        self.set_keyboard_console_enabled(False)
         self.stop_repeat_senders()
         self.project_settings = ProjectSettings()
         self._send_rows = []
@@ -171,9 +175,18 @@ class HomePage(tk.Tk):
             self._draw_stop_icon,
             self.routes.stop_communication,
         )
-        stop_btn.pack(side=tk.LEFT, padx=(2, 6), pady=2)
+        stop_btn.pack(side=tk.LEFT, padx=(2, 0), pady=2)
 
-    def _toolbar_icon_button(self, parent, draw_icon, command):
+        keyboard_btn, keyboard_canvas = self._toolbar_icon_button(
+            toolbar,
+            self._draw_keyboard_icon,
+            self.routes.toggle_keyboard_console,
+            return_canvas=True,
+        )
+        keyboard_btn.pack(side=tk.LEFT, padx=(2, 6), pady=2)
+        self._keyboard_console_canvas = keyboard_canvas
+
+    def _toolbar_icon_button(self, parent, draw_icon, command, return_canvas=False):
         normal_bg = "#d4d0c8"
         hover_bg = "#b8b4ac"
 
@@ -205,6 +218,8 @@ class HomePage(tk.Tk):
             widget.bind("<Enter>", on_enter)
             widget.bind("<Leave>", on_leave)
 
+        if return_canvas:
+            return frame, canvas
         return frame
 
     @staticmethod
@@ -218,6 +233,123 @@ class HomePage(tk.Tk):
         canvas.create_rectangle(
             8, 8, 16, 16, fill="#808080", outline="#505050", width=1
         )
+
+    @staticmethod
+    def _draw_keyboard_icon(canvas, active=False):
+        canvas.delete("all")
+        body_fill = "#9a9a9a" if active else "#c0c0c0"
+        canvas.create_rectangle(4, 10, 20, 18, fill=body_fill, outline="#000000", width=1)
+        for x in (7, 10, 13, 16):
+            canvas.create_rectangle(x, 12, x + 2, 14, fill="#ffffff", outline="")
+            canvas.create_rectangle(x, 15, x + 2, 17, fill="#ffffff", outline="")
+        canvas.create_line(4, 10, 4, 7, 7, 5, 10, 4, 13, 6, fill="#000000", width=1)
+
+    def set_keyboard_console_enabled(self, enabled):
+        enabled = bool(enabled)
+        if self._keyboard_console_enabled == enabled:
+            return
+
+        self._keyboard_console_enabled = enabled
+        self._update_keyboard_console_bindings()
+        self._update_keyboard_console_button()
+        if enabled:
+            self.port_status.set(
+                "Communication port {} open - Keyboard Console On".format(
+                    self.project_settings.get("channel")
+                )
+            )
+        elif self.comm_service.is_connected():
+            self.port_status.set(
+                "Communication port {} open".format(
+                    self.project_settings.get("channel")
+                )
+            )
+
+    def _update_keyboard_console_button(self):
+        if self._keyboard_console_canvas is None:
+            return
+        self._draw_keyboard_icon(
+            self._keyboard_console_canvas,
+            active=self._keyboard_console_enabled,
+        )
+
+    def _update_keyboard_console_bindings(self):
+        if not self._comm_texts:
+            return
+
+        for text_widget in self._comm_texts.values():
+            text_widget.unbind("<Key>")
+            text_widget.unbind("<Button-1>")
+            if self._keyboard_console_enabled:
+                text_widget.config(state=tk.NORMAL, cursor="xterm")
+                text_widget.bind("<Key>", self._on_keyboard_console_key)
+                text_widget.bind("<Button-1>", self._on_keyboard_console_click, add="+")
+            else:
+                text_widget.config(state=tk.DISABLED, cursor="arrow")
+
+    def _on_keyboard_console_click(self, event):
+        widget = event.widget
+        widget.focus_set()
+        widget.mark_set(tk.INSERT, tk.END)
+        return "break"
+
+    def _keyboard_event_to_bytes(self, event):
+        if event.state & 0x4:
+            keysym = event.keysym.lower()
+            if keysym == "v":
+                try:
+                    text = self.clipboard_get()
+                except tk.TclError:
+                    return b""
+                return text[:1024].encode("latin-1", errors="replace")
+            if len(event.keysym) == 1:
+                code = ord(event.keysym.upper()) - 64
+                if 1 <= code <= 26:
+                    return bytes([code])
+            return b""
+
+        if event.keysym in ("Return", "KP_Enter"):
+            return b"\r\n"
+        if event.keysym == "Escape":
+            return b"\x1b"
+        if event.keysym == "Tab":
+            return b"\t"
+        if event.keysym == "BackSpace":
+            return b"\x08"
+        if event.char and event.char not in ("\r",):
+            return event.char.encode("latin-1", errors="replace")
+        return None
+
+    def _on_keyboard_console_key(self, event):
+        if not self._keyboard_console_enabled or not self.comm_service.is_connected():
+            return "break"
+
+        payload = self._keyboard_event_to_bytes(event)
+        if payload is None:
+            return "break"
+        if not payload:
+            return "break"
+
+        try:
+            self.comm_service.send_bytes(payload, label="Keyboard")
+        except Exception as exc:
+            messagebox.showerror(
+                "Keyboard Console",
+                "Could not send keyboard input:\n{}".format(exc),
+                parent=self,
+            )
+        return "break"
+
+    def _with_comm_text_enabled(self, callback):
+        widgets = list(self._comm_texts.values())
+        for text_widget in widgets:
+            text_widget.config(state=tk.NORMAL)
+        try:
+            callback()
+        finally:
+            if not self._keyboard_console_enabled:
+                for text_widget in widgets:
+                    text_widget.config(state=tk.DISABLED)
 
     def _build_status_bar(self):
         status_frame = tk.Frame(self, bg="#d9d9d9")
@@ -270,6 +402,29 @@ class HomePage(tk.Tk):
             now.microsecond // 1000,
         )
 
+    def _get_channel_label(self, direction):
+        """Return alias for TX/RX if set in project settings, else the direction."""
+        aliases = self.project_settings.get("channel_aliases", ("", ""))
+        index = 0 if direction == "TX" else 1
+        if index < len(aliases):
+            alias = aliases[index].strip()
+            if alias:
+                return alias
+        return direction
+
+    def _should_show_comm_data(self, direction):
+        """Whether raw TX/RX byte lines should appear in the communication panel."""
+        filt = self.project_settings.get("contents_filter", "all")
+        if filt == "all":
+            return True
+        if filt == "channel1":
+            return direction == "TX"
+        if filt == "channel2":
+            return direction == "RX"
+        if filt == "comments_only":
+            return False
+        return True
+
     @staticmethod
     def _configure_comm_tags(text_widget):
         text_widget.tag_configure("meta", foreground="#008000")
@@ -281,8 +436,9 @@ class HomePage(tk.Tk):
 
     def _insert_comm_header(self, text_widget, direction):
         timestamp = self._format_comm_timestamp()
+        label = self._get_channel_label(direction)
         text_widget.insert(tk.END, timestamp + " ", "meta")
-        text_widget.insert(tk.END, "[{}]".format(direction), "meta")
+        text_widget.insert(tk.END, "[{}]".format(label), "meta")
         text_widget.insert(tk.END, " - ", "meta")
 
     def _insert_comm_payload(self, text_widget, data, mode, data_tag):
@@ -298,11 +454,14 @@ class HomePage(tk.Tk):
         if not self._comm_texts:
             return
 
-        for text_widget in self._comm_texts.values():
-            self._insert_comm_header(text_widget, direction)
-            text_widget.insert(tk.END, line, tag)
-            text_widget.insert(tk.END, "\n")
-            text_widget.see(tk.END)
+        def insert_lines():
+            for text_widget in self._comm_texts.values():
+                self._insert_comm_header(text_widget, direction)
+                text_widget.insert(tk.END, line, tag)
+                text_widget.insert(tk.END, "\n")
+                text_widget.see(tk.END)
+
+        self._with_comm_text_enabled(insert_lines)
 
     def _get_rx_inline_suffix(self, matches):
         """Comment text appended on the matched RX data line (all action types)."""
@@ -323,6 +482,17 @@ class HomePage(tk.Tk):
 
         return "", False
 
+    def _append_comm_blank_line(self):
+        if not self._comm_texts:
+            return
+
+        def insert_blank():
+            for text_widget in self._comm_texts.values():
+                text_widget.insert(tk.END, "\n")
+                text_widget.see(tk.END)
+
+        self._with_comm_text_enabled(insert_blank)
+
     def _append_comm_data(
         self,
         data,
@@ -333,6 +503,18 @@ class HomePage(tk.Tk):
         if not self._comm_texts:
             return
 
+        if not self._should_show_comm_data(direction):
+            if (
+                self.project_settings.get("contents_filter") == "comments_only"
+                and inline_suffix
+            ):
+                self._append_comm_line(
+                    inline_suffix, tag="status", direction=direction
+                )
+                if extra_line_break:
+                    self._append_comm_blank_line()
+            return
+
         lines = list(iter_comm_lines(data))
         if not lines and data:
             lines = [(data, b"")]
@@ -340,23 +522,26 @@ class HomePage(tk.Tk):
         data_tag = "rx_data" if direction == "RX" else "tx_data"
         last_line_index = len(lines) - 1
 
-        for tab_name, text_widget in self._comm_texts.items():
-            for index, (line_bytes, ending) in enumerate(lines):
-                if index == 0:
-                    self._insert_comm_header(text_widget, direction)
+        def insert_data():
+            for tab_name, text_widget in self._comm_texts.items():
+                for index, (line_bytes, ending) in enumerate(lines):
+                    if index == 0:
+                        self._insert_comm_header(text_widget, direction)
 
-                self._insert_comm_payload(text_widget, line_bytes, tab_name, data_tag)
-                self._insert_comm_line_ending(text_widget, ending)
+                    self._insert_comm_payload(text_widget, line_bytes, tab_name, data_tag)
+                    self._insert_comm_line_ending(text_widget, ending)
 
-                if inline_suffix and index == last_line_index:
-                    text_widget.insert(tk.END, "  {}".format(inline_suffix), "meta")
+                    if inline_suffix and index == last_line_index:
+                        text_widget.insert(tk.END, "  {}".format(inline_suffix), "meta")
 
-                text_widget.insert(tk.END, "\n")
+                    text_widget.insert(tk.END, "\n")
 
-            if extra_line_break and inline_suffix:
-                text_widget.insert(tk.END, "\n")
+                if extra_line_break and inline_suffix:
+                    text_widget.insert(tk.END, "\n")
 
-            text_widget.see(tk.END)
+                text_widget.see(tk.END)
+
+        self._with_comm_text_enabled(insert_data)
 
     def _handle_receive_matches(self, matches):
         for match in matches:
@@ -439,6 +624,7 @@ class HomePage(tk.Tk):
             )
 
     def apply_project_settings(self, settings):
+        self.set_keyboard_console_enabled(False)
         was_open = self.comm_service.is_connected()
         if was_open:
             self.routes.stop_communication()
@@ -986,8 +1172,11 @@ class HomePage(tk.Tk):
         return frame
 
     def _clear_communication_panel(self):
-        for text_widget in self._comm_texts.values():
-            text_widget.delete("1.0", tk.END)
+        def clear_texts():
+            for text_widget in self._comm_texts.values():
+                text_widget.delete("1.0", tk.END)
+
+        self._with_comm_text_enabled(clear_texts)
 
     def _build_communication_panel(self):
         frame = ttk.LabelFrame(self, text="", padding=4)
@@ -1030,6 +1219,7 @@ class HomePage(tk.Tk):
 
         notebook.bind("<<NotebookTabChanged>>", self._on_comm_tab_changed)
         notebook.select(1)
+        self._update_keyboard_console_bindings()
         return frame
 
 
