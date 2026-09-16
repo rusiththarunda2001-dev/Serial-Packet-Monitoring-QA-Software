@@ -1,0 +1,17 @@
+7/16/2026 09:33:13.053 - --- Automation Test Script Started ---
+
+7/16/2026 09:33:13.056 [TX] - Hello World!
+7/16/2026 09:33:13.562 [TX] - Hello World!
+7/16/2026 09:33:14.067 [TX] - Hello World!
+7/16/2026 09:33:14.573 [TX] - Hello World!
+7/16/2026 09:33:15.131 [TX] - Hello World!
+7/16/2026 09:33:16.311 [RX] - Hello World!   ping recieved
+Hello World!   ping recieved
+Hello World!   ping recieved
+Hello World!   ping recieved
+Hello World!   ping recieved
+<CR><LF>
+7/16/2026 09:33:20.636 - --- Send Loops Completed. Clearing screen in 2 seconds ---
+
+7/16/2026 09:33:20.659 - --- Terminal Cleared. Generating Log File ---
+

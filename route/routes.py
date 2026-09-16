@@ -4,6 +4,7 @@ import tkinter.messagebox as messagebox
 from tkinter import filedialog
 
 from core.checksum_rules import DEFAULT_CHECKSUM
+from core.script_engine import run_script
 from core.project_file import (
     PROJECT_FILE_EXTENSION,
     PROJECT_FILE_TYPES,
@@ -132,6 +133,7 @@ class Routes:
         port = self.home.project_settings.get("channel")
         self.home._communication_open = True
         self.home.port_status.set("Communication port {} open".format(port))
+        self.home._refresh_handshake_indicators()
 
     def stop_communication(self):
         self.home.set_keyboard_console_enabled(False)
@@ -139,6 +141,7 @@ class Routes:
         self.home.comm_service.disconnect()
         self.home._communication_open = False
         self.home.port_status.set("Communication port closed")
+        self.home._refresh_handshake_indicators()
 
     def toggle_keyboard_console(self):
         if self.home._keyboard_console_enabled:
@@ -162,6 +165,9 @@ class Routes:
             return
 
         self.home.set_keyboard_console_enabled(True)
+
+    def edit_script(self):
+        self.home.focus_script_editor()
 
     def open_send_sequence_editor(self, row_index):
         if not (0 <= row_index < len(self.home._send_rows)):
@@ -281,6 +287,16 @@ class Routes:
             row[0] = values[0]
             self.home._receive_rows[row_index] = tuple(row)
             self.home.mark_project_dirty()
+    
+    def run_script(self):
+            script_text = self.home.get_script_text()
+            if not script_text.strip():
+                messagebox.showinfo("Script Engine", "The script editor is empty.", parent=self.home)
+                return
+
+            # No more text parsing! Just send the script to the background thread.
+            run_script(script_text, self.home)
+            return True
 
 
 if __name__ == "__main__":

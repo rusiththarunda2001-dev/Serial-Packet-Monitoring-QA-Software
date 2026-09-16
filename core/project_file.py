@@ -1,8 +1,8 @@
-"""Save and load Docklight project files."""
+"""Save and load Docklight project files as Excel Workbooks."""
 
 from __future__ import annotations
 
-import json
+import openpyxl
 from copy import deepcopy
 from pathlib import Path
 
@@ -12,12 +12,12 @@ from core.receive_actions import (
     parse_receive_action,
     receive_action_fields,
 )
-from project_settings import DEFAULT_PROJECT_SETTINGS
+from core.settings_saver import DEFAULT_PROJECT_SETTINGS
 
 PROJECT_FORMAT_VERSION = 1
-PROJECT_FILE_EXTENSION = ".dck"
+PROJECT_FILE_EXTENSION = ".xlsx"
 PROJECT_FILE_TYPES = [
-    ("Docklight Project", "*.dck"),
+    ("Docklight Project (Excel)", "*.xlsx"),
     ("All files", "*.*"),
 ]
 
@@ -177,6 +177,17 @@ def apply_project_document(home, document: dict) -> None:
 
     home._send_rows = [_deserialize_send_row(row) for row in send_rows]
     home._receive_rows = [_deserialize_receive_row(row) for row in receive_rows]
+    
+    script_commands = document.get("script_commands", [])
+
+
+    if hasattr(home, "clear_script_editor") and hasattr(home, "_script_sheet"):
+        home.clear_script_editor()
+        if script_commands:
+            # Reconstruct the sheet matrix using only the raw command strings
+            sheet_data = [[str(cmd)] for cmd in script_commands]
+            home._script_sheet.set_sheet_data(sheet_data)
+            home._script_sheet.redraw()
 
     display_mode = document.get("display_mode", "HEX")
     if display_mode not in ("ASCII", "HEX", "Decimal", "Binary"):
@@ -191,33 +202,244 @@ def apply_project_document(home, document: dict) -> None:
         if display_mode in modes:
             home._comm_notebook.select(modes.index(display_mode))
 
+    if hasattr(home, "comm_service"):
+        home.comm_service.configure_session(home.project_settings.as_dict())
+    if hasattr(home, "_update_flow_control_bar"):
+        home._update_flow_control_bar()
+
 
 def save_project_file(path, home) -> None:
-    """Write the current project to disk."""
+    """Write the current project to disk as a multi-sheet Excel file."""
+    # 1. Gather all data using your existing JSON-style builder
     document = build_project_document(home)
+    
+    # 2. Create a new Excel Workbook
+    wb = openpyxl.Workbook()
+    
+    # ==========================================
+    # SHEET 01: Project Settings & Meta Data
+    # ==========================================
+    ws_settings = wb.active
+    ws_settings.title = "Sheet01_Settings"
+    ws_settings.append(["Meta/Setting Key", "Value"])
+    
+    ws_settings.append(["format_version", str(document.get("format_version", ""))])
+    ws_settings.append(["app", str(document.get("app", ""))])
+    ws_settings.append(["display_mode", str(document.get("display_mode", ""))])
+    
+    settings = document.get("settings", {})
+    for key, value in settings.items():
+        if isinstance(value, (list, tuple)):
+            value = ", ".join(map(str, value))
+        ws_settings.append([key, str(value)])
+
+
+    # ==========================================
+    # SHEET 02: Send Sequences
+    # ==========================================
+    ws_send = wb.create_sheet(title="Sheet02_Send_Sequences")
+    send_headers = [
+        "name", "sequence", "periodic", "checksum", 
+        "display_mode", "repeat_interval"
+    ]
+    ws_send.append(send_headers)
+    
+    for row_dict in document.get("send_sequences", []):
+        ws_send.append([
+            str(row_dict.get("name", "")),
+            str(row_dict.get("sequence", "")),
+            str(row_dict.get("periodic", False)),
+            str(row_dict.get("checksum", "")),
+            str(row_dict.get("display_mode", "")),
+            str(row_dict.get("repeat_interval", 0.0))
+        ])
+
+
+    # ==========================================
+    # SHEET 03: Receive Sequences
+    # ==========================================
+    ws_receive = wb.create_sheet(title="Sheet03_Receive_Sequences")
+    receive_headers = [
+        "active", "name", "sequence", "checksum", "checksum_detect", "display_mode",
+        "action_type", "answer_send_index", "comment_text", "comment_line_break",
+        "comment_timestamp", "snapshot_trigger", "stop_communication"
+    ]
+    ws_receive.append(receive_headers)
+    
+    for row_dict in document.get("receive_sequences", []):
+        action = row_dict.get("action", {})
+        ws_receive.append([
+            str(row_dict.get("active", False)),
+            str(row_dict.get("name", "")),
+            str(row_dict.get("sequence", "")),
+            str(row_dict.get("checksum", "")),
+            str(row_dict.get("checksum_detect", "")),
+            str(row_dict.get("display_mode", "")),
+            str(action.get("action_type", "")),
+            str(action.get("answer_send_index", "")),
+            str(action.get("comment_text", "")),
+            str(action.get("comment_line_break", True)),
+            str(action.get("comment_timestamp", False)),
+            str(action.get("snapshot_trigger", True)),
+            str(action.get("stop_communication", False))
+        ])
+
+
+    # ==========================================
+    # SHEET 04: Project Script
+    # ==========================================
+    ws_script = wb.create_sheet(title="Sheet04_Script")
+    ws_script.append(["command number", "command"])
+    
+    if hasattr(home, "get_script_text"):
+        script_text = home.get_script_text()
+        command_number = 1
+        for line in script_text.splitlines():
+            line = line.strip()
+            if line:
+                # Add the sequential number and the entire line as a single string
+                ws_script.append([command_number, line])
+                command_number += 1
+
+
+    # ==========================================
+    # Save the Workbook to Disk
+    # ==========================================
     target = Path(path)
     if target.suffix.lower() != PROJECT_FILE_EXTENSION:
         target = target.with_suffix(PROJECT_FILE_EXTENSION)
-
+        
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            json.dumps(document, indent=2, ensure_ascii=True) + "\n",
-            encoding="utf-8",
-        )
+        wb.save(target)
     except OSError as exc:
         raise ProjectFileError("Could not save project:\n{}".format(exc)) from exc
 
 
 def load_project_file(path) -> dict:
-    """Read a project file from disk."""
+    """Read an Excel project file and reconstruct the document dictionary."""
     source = Path(path)
     if not source.is_file():
         raise ProjectFileError("Project file not found:\n{}".format(source))
 
     try:
-        document = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        wb = openpyxl.load_workbook(source, data_only=True)
+    except Exception as exc:
         raise ProjectFileError("Could not read project file:\n{}".format(exc)) from exc
+
+    # Base dictionary structure that apply_project_document expects
+    document = {
+        "format_version": PROJECT_FORMAT_VERSION,
+        "app": "EC Docklight",
+        "display_mode": "HEX",
+        "settings": {},
+        "send_sequences": [],
+        "receive_sequences": [],
+        "script_commands": []
+    }
+
+    # ==========================================
+    # Read SHEET 01: Project Settings
+    # ==========================================
+    if "Sheet01_Settings" in wb.sheetnames:
+        ws_settings = wb["Sheet01_Settings"]
+        for row in ws_settings.iter_rows(min_row=2, values_only=True): 
+            if not row or row[0] is None:
+                continue
+            
+            key = str(row[0])
+            val = str(row[1]) if row[1] is not None else ""
+
+            if key == "format_version":
+                try:
+                    document["format_version"] = int(val)
+                except ValueError:
+                    document["format_version"] = PROJECT_FORMAT_VERSION
+            elif key == "app":
+                document["app"] = val
+            elif key == "display_mode":
+                document["display_mode"] = val
+            else:
+                if key == "channel_aliases":
+                    aliases = [a.strip() for a in val.split(",")]
+                    while len(aliases) < 2:
+                        aliases.append("")
+                    document["settings"][key] = aliases[:2]
+                else:
+                    document["settings"][key] = val
+
+    # ==========================================
+    # Read SHEET 02: Send Sequences
+    # ==========================================
+    if "Sheet02_Send_Sequences" in wb.sheetnames:
+        ws_send = wb["Sheet02_Send_Sequences"]
+        if ws_send.max_row > 1:
+            headers = [str(c.value) if c.value else "" for c in ws_send[1]]
+            
+            for row in ws_send.iter_rows(min_row=2, values_only=True):
+                if not any(row): continue
+                
+                row_dict = {}
+                for i, header in enumerate(headers):
+                    if i < len(row):
+                        val = row[i]
+                        if header == "periodic":
+                            val = str(val).lower() in ("true", "1")
+                        elif header == "repeat_interval":
+                            try: val = float(val)
+                            except (ValueError, TypeError): val = 0.0
+                        elif val is None:
+                            val = ""
+                            
+                        row_dict[header] = val
+                document["send_sequences"].append(row_dict)
+
+    # ==========================================
+    # Read SHEET 03: Receive Sequences
+    # ==========================================
+    if "Sheet03_Receive_Sequences" in wb.sheetnames:
+        ws_receive = wb["Sheet03_Receive_Sequences"]
+        if ws_receive.max_row > 1:
+            headers = [str(c.value) if c.value else "" for c in ws_receive[1]]
+            
+            action_keys = {
+                "action_type", "answer_send_index", "comment_text", 
+                "comment_line_break", "comment_timestamp", 
+                "snapshot_trigger", "stop_communication"
+            }
+
+            for row in ws_receive.iter_rows(min_row=2, values_only=True):
+                if not any(row): continue
+                
+                row_dict = {"action": {}}
+                for i, header in enumerate(headers):
+                    if i < len(row):
+                        val = row[i] if row[i] is not None else ""
+                        
+                        if header in ("active", "comment_line_break", "comment_timestamp", "snapshot_trigger", "stop_communication"):
+                            val = str(val).lower() in ("true", "1")
+                        elif header == "answer_send_index":
+                            try: val = int(val)
+                            except (ValueError, TypeError): val = 0
+                        
+                        if header in action_keys:
+                            row_dict["action"][header] = val
+                        else:
+                            row_dict[header] = val
+                            
+                document["receive_sequences"].append(row_dict)
+
+    # ==========================================
+    # Read SHEET 04: Project Script
+    # ==========================================
+    if "Sheet04_Script" in wb.sheetnames:
+        ws_script = wb["Sheet04_Script"]
+        # Start from row 2 to skip the header
+        for row in ws_script.iter_rows(min_row=2, values_only=True):
+            if not row or not any(row): 
+                continue
+            # row[0] is command_number, row[1] is the command string
+            if len(row) > 1 and row[1]:
+                document["script_commands"].append(str(row[1]))
 
     return document

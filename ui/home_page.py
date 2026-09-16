@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path
+import tksheet
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -34,9 +35,16 @@ from core.sequence_codec import (
     encode_sequence,
     format_sequence_display,
 )
-from project_settings import ProjectSettings
+from core.settings_saver import ProjectSettings
 from route.routes import Routes
 from ui.edit_receive_sequence import DEFAULT_CHECKSUM_DETECT
+
+
+_FLOW_CONTROL_BAR_LABELS = {
+    "manual": "Manual RTS/DTR Control",
+    "hardware": "RTS/CTS Handshaking",
+    "software": "XON/XOFF Handshaking",
+}
 
 
 class HomePage(tk.Tk):
@@ -59,7 +67,10 @@ class HomePage(tk.Tk):
         self._communication_open = False
         self._keyboard_console_enabled = False
         self._keyboard_console_canvas = None
+        self._toolbar_images = []
         self._comm_texts = {}
+        self._handshake_poll_id = None
+        self._handshake_indicators = {}
         self.comm_service = CommService(self._on_comm_event)
         self.routes = Routes(self)
 
@@ -70,6 +81,7 @@ class HomePage(tk.Tk):
         self.routes.bind()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after_idle(self._refresh_send_buttons)
+        self.after_idle(self._sync_flow_control_session)
         self._update_window_title()
 
     def _build_menu(self):
@@ -89,7 +101,7 @@ class HomePage(tk.Tk):
         menubar.add_cascade(label="File", menu=file_menu)
         self._file_menu = file_menu
 
-        for label in ("Edit", "Run", "Tools", "Scripting", "Help"):
+        for label in ("Edit", "Run", "Tools", "Help"):
             menu = tk.Menu(menubar, tearoff=0)
             menu.add_command(label="{} item".format(label))
             menubar.add_cascade(label=label, menu=menu)
@@ -129,6 +141,8 @@ class HomePage(tk.Tk):
         self._receive_rows = []
         self._global_display_mode = "HEX"
         self.com_port.set(self.project_settings.get("channel"))
+        self.comm_service.configure_session(self.project_settings.as_dict())
+        self._update_flow_control_bar()
         self._refresh_send_tree()
         self._refresh_receive_tree()
         if hasattr(self, "_comm_notebook"):
@@ -160,31 +174,74 @@ class HomePage(tk.Tk):
         return True
 
     def _build_toolbar(self):
-        toolbar = tk.Frame(self, bg="#d4d0c8", relief=tk.RAISED, bd=1)
-        toolbar.pack(fill=tk.X)
+            toolbar = tk.Frame(self, bg="#d4d0c8", relief=tk.RAISED, bd=1)
+            toolbar.pack(fill=tk.X)
 
-        play_btn = self._toolbar_icon_button(
-            toolbar,
-            self._draw_play_icon,
-            self.routes.start_communication,
-        )
-        play_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
+            play_btn = self._toolbar_icon_button(
+                toolbar,
+                self._draw_play_icon,
+                self.routes.start_communication,
+            )
+            play_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
 
-        stop_btn = self._toolbar_icon_button(
-            toolbar,
-            self._draw_stop_icon,
-            self.routes.stop_communication,
-        )
-        stop_btn.pack(side=tk.LEFT, padx=(2, 0), pady=2)
+            stop_btn = self._toolbar_icon_button(
+                toolbar,
+                self._draw_stop_icon,
+                self.routes.stop_communication,
+            )
+            stop_btn.pack(side=tk.LEFT, padx=(2, 0), pady=2)
 
-        keyboard_btn, keyboard_canvas = self._toolbar_icon_button(
-            toolbar,
-            self._draw_keyboard_icon,
-            self.routes.toggle_keyboard_console,
-            return_canvas=True,
-        )
-        keyboard_btn.pack(side=tk.LEFT, padx=(2, 6), pady=2)
-        self._keyboard_console_canvas = keyboard_canvas
+            edit_btn = self._toolbar_image_button(
+                toolbar, "edit_script.png", self.routes.edit_script
+            )
+            edit_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
+
+            keyboard_btn, keyboard_canvas = self._toolbar_icon_button(
+                toolbar,
+                self._draw_keyboard_icon,
+                self.routes.toggle_keyboard_console,
+                return_canvas=True,
+            )
+            keyboard_btn.pack(side=tk.LEFT, padx=(2, 6), pady=2)
+            self._keyboard_console_canvas = keyboard_canvas
+
+    # --- NEW SCRIPTING BUTTONS ---
+            tk.Frame(toolbar, width=8, bg="#d4d0c8").pack(side=tk.LEFT)
+
+            self._btn_script_play = self._toolbar_image_button(
+                toolbar, 
+                "play.png", 
+                self._on_script_play, 
+                disabled_image_name="play_disabled.png"
+            )
+            self._btn_script_play.pack(side=tk.LEFT, padx=(2, 0), pady=2)
+
+            self._btn_script_pause = self._toolbar_image_button(
+                toolbar, 
+                "pause.png", 
+                self._on_script_pause, 
+                disabled_image_name="pause_disabled.png"
+            )
+            self._btn_script_pause.pack(side=tk.LEFT, padx=(2, 0), pady=2)
+
+            self._btn_script_stop = self._toolbar_image_button(
+                toolbar, 
+                "stop.png", 
+                self._on_script_stop, 
+                disabled_image_name="stop_disabled.png"
+            )
+            self._btn_script_stop.pack(side=tk.LEFT, padx=(2, 0), pady=2)
+
+            # Initialize the button states
+            self._btn_script_play.set_state(True)
+            self._btn_script_pause.set_state(False)
+            self._btn_script_stop.set_state(False)
+
+    def _load_toolbar_image(self, filename):
+            path = Path(__file__).resolve().parent / "assets" / "toolbar" / filename
+            image = tk.PhotoImage(file=str(path))
+            self._toolbar_images.append(image)
+            return image
 
     def _toolbar_icon_button(self, parent, draw_icon, command, return_canvas=False):
         normal_bg = "#d4d0c8"
@@ -222,6 +279,112 @@ class HomePage(tk.Tk):
             return frame, canvas
         return frame
 
+
+
+    def _toolbar_image_button(self, parent, image_name, command, disabled_image_name=None):
+            normal_bg = "#d4d0c8"
+            hover_bg = "#b8b4ac"
+            click_bg = "#a0a0a0"
+            
+            # Load the normal image, and the disabled image if one was provided
+            image_active = self._load_toolbar_image(image_name)
+            if disabled_image_name:
+                image_disabled = self._load_toolbar_image(disabled_image_name)
+            else:
+                image_disabled = image_active  # Fallback if no disabled image is provided
+
+            # Track our custom state manually
+            state = {"enabled": True}
+
+            def safe_command():
+                if state["enabled"]:
+                    command()
+
+            btn = tk.Button(
+                parent,
+                image=image_active,
+                command=safe_command,
+                relief=tk.FLAT,
+                bg=normal_bg,
+                activebackground=click_bg,
+                bd=1,
+                cursor="hand2"
+            )
+
+            def on_click(_event):
+                if not state["enabled"]:
+                    return "break"
+
+            def on_enter(_event):
+                if state["enabled"]:
+                    btn.configure(bg=hover_bg)
+
+            def on_leave(_event):
+                if state["enabled"]:
+                    btn.configure(bg=normal_bg)
+
+            def set_state(enabled):
+                state["enabled"] = enabled
+                if enabled:
+                    # Swap to the colorful/active image
+                    btn.config(image=image_active, bg=normal_bg, cursor="hand2")
+                else:
+                    # Swap to the grayed-out image
+                    btn.config(image=image_disabled, bg=normal_bg, cursor="arrow")
+
+            # Bind events
+            btn.bind("<Button-1>", on_click)
+            btn.bind("<Enter>", on_enter)
+            btn.bind("<Leave>", on_leave)
+
+            btn.set_state = set_state
+            return btn
+    def _on_script_play(self):
+            # If the script was previously paused, resume it
+            if getattr(self, "_script_paused", False):
+                self._script_paused = False
+                
+                # Update button states for resuming
+                self._btn_script_play.set_state(False)
+                self._btn_script_pause.set_state(True)
+                self._btn_script_stop.set_state(True)
+            else:
+                # Try starting a fresh script run. Only update states if it actually fires!
+                if self.routes.run_script():
+                    self._btn_script_play.set_state(False)   # Deactivate Play
+                    self._btn_script_pause.set_state(True)   # Activate Pause
+                    self._btn_script_stop.set_state(True)    # Activate Stop
+                else:
+                    # If run_script returned False (e.g., empty editor), ensure 
+                    # Play stays active and the others stay deactivated.
+                    self._btn_script_play.set_state(True)
+                    self._btn_script_pause.set_state(False)
+                    self._btn_script_stop.set_state(False)
+
+    def _on_script_pause(self):
+            # Set pause flag high to halt execution loop in background thread
+            self._script_paused = True
+            
+            # Explicitly set the exact states for this button action
+            self._btn_script_play.set_state(True)    # Activate Play (to allow resume)
+            self._btn_script_pause.set_state(False)  # Deactivate Pause
+            self._btn_script_stop.set_state(True)    # Keep Stop active    
+
+    def _on_script_stop(self):
+            # Set stop flag high to completely break out of background thread execution
+            self._script_stopped = True
+            self._script_paused = False
+            
+            # Close the hardware communication line immediately
+            self.routes.stop_communication()
+            
+            # Explicitly reset the buttons back to the default/idle layout right here
+            self._btn_script_play.set_state(True)    # Activate Play
+            self._btn_script_pause.set_state(False)  # Deactivate Pause
+            self._btn_script_stop.set_state(False)   # Deactivate Stop    
+
+
+
     @staticmethod
     def _draw_play_icon(canvas):
         canvas.create_polygon(
@@ -233,6 +396,7 @@ class HomePage(tk.Tk):
         canvas.create_rectangle(
             8, 8, 16, 16, fill="#808080", outline="#505050", width=1
         )
+    
 
     @staticmethod
     def _draw_keyboard_icon(canvas, active=False):
@@ -331,7 +495,8 @@ class HomePage(tk.Tk):
             return "break"
 
         try:
-            self.comm_service.send_bytes(payload, label="Keyboard")
+            if not self.comm_service.send_bytes(payload, label="Keyboard"):
+                return "break"
         except Exception as exc:
             messagebox.showerror(
                 "Keyboard Console",
@@ -354,6 +519,7 @@ class HomePage(tk.Tk):
     def _build_status_bar(self):
         status_frame = tk.Frame(self, bg="#d9d9d9")
         status_frame.pack(fill=tk.X, padx=8, pady=(2, 0))
+        self._status_frame = status_frame
 
         self.port_status = tk.StringVar(value="Communication port closed")
         tk.Label(
@@ -364,9 +530,150 @@ class HomePage(tk.Tk):
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT)
 
+        self._flow_control_frame = tk.Frame(status_frame, bg="#d9d9d9")
+        self._flow_control_frame.pack(side=tk.RIGHT)
+
+        self._flow_control_title = tk.Label(
+            self._flow_control_frame,
+            text="Manual RTS/DTR Control",
+            bg="#d9d9d9",
+            font=("Segoe UI", 8),
+        )
+        self._flow_control_title.pack(side=tk.TOP, anchor=tk.E, pady=(0, 2))
+
+        indicators_row = tk.Frame(self._flow_control_frame, bg="#d9d9d9")
+        indicators_row.pack(side=tk.TOP)
+        self._handshake_indicators_row = indicators_row
+
+        for signal, toggleable in (
+            ("RTS", True),
+            ("DTR", True),
+            ("CTS", False),
+            ("DSR", False),
+            ("DCD", False),
+            ("RI", False),
+        ):
+            cell = tk.Frame(indicators_row, bg="#d9d9d9", padx=6)
+            cell.pack(side=tk.LEFT)
+
+            tk.Label(
+                cell,
+                text=signal,
+                bg="#d9d9d9",
+                font=("Segoe UI", 8),
+            ).pack()
+
+            canvas = tk.Canvas(
+                cell,
+                width=16,
+                height=16,
+                bg="#d9d9d9",
+                highlightthickness=0,
+                bd=0,
+            )
+            canvas.pack(pady=(2, 0))
+
+            key = signal.lower()
+            self._handshake_indicators[key] = {
+                "canvas": canvas,
+                "toggleable": toggleable,
+            }
+
+            if toggleable:
+                canvas.configure(cursor="hand2")
+                canvas.bind(
+                    "<Double-Button-1>",
+                    lambda _e, sig=key: self._toggle_handshake_output(sig),
+                )
+
+        self._flow_control_frame.pack_forget()
+
+    def _sync_flow_control_session(self):
+        self.comm_service.configure_session(self.project_settings.as_dict())
+        self._update_flow_control_bar()
+
+    def _flow_control_bar_mode(self):
+        mode = self.project_settings.get("flow_control", "off")
+        if mode in _FLOW_CONTROL_BAR_LABELS:
+            return mode
+        return None
+
+    def _update_flow_control_bar(self):
+        mode = self._flow_control_bar_mode()
+        if mode:
+            self._flow_control_title.config(text=_FLOW_CONTROL_BAR_LABELS[mode])
+            self._configure_handshake_interaction(mode)
+            if mode == "manual":
+                self._handshake_indicators_row.pack(side=tk.TOP)
+                self._refresh_handshake_indicators()
+                self._schedule_handshake_poll()
+            else:
+                self._handshake_indicators_row.pack_forget()
+                self._cancel_handshake_poll()
+            self._flow_control_frame.pack(side=tk.RIGHT)
+        else:
+            self._flow_control_frame.pack_forget()
+            self._cancel_handshake_poll()
+
+    def _configure_handshake_interaction(self, flow_mode):
+        for key, widgets in self._handshake_indicators.items():
+            toggleable = flow_mode == "manual" and key in ("rts", "dtr")
+            widgets["toggleable"] = toggleable
+            widgets["canvas"].configure(cursor="hand2" if toggleable else "")
+
+    def _schedule_handshake_poll(self):
+        self._cancel_handshake_poll()
+        if not self._flow_control_bar_mode():
+            return
+        self._handshake_poll_id = self.after(200, self._poll_handshake_lines)
+
+    def _cancel_handshake_poll(self):
+        if self._handshake_poll_id is not None:
+            try:
+                self.after_cancel(self._handshake_poll_id)
+            except tk.TclError:
+                pass
+            self._handshake_poll_id = None
+
+    def _poll_handshake_lines(self):
+        self._handshake_poll_id = None
+        if not self._flow_control_bar_mode():
+            return
+        self._refresh_handshake_indicators()
+        self._schedule_handshake_poll()
+
+    def _refresh_handshake_indicators(self):
+        state = self.comm_service.get_handshake_state()
+        for key, widgets in self._handshake_indicators.items():
+            self._draw_handshake_indicator(widgets["canvas"], state.get(key, False))
+
+    @staticmethod
+    def _draw_handshake_indicator(canvas, active):
+        canvas.delete("all")
+        if active:
+            canvas.create_oval(2, 2, 14, 14, fill="#1a5fb4", outline="#1a5fb4")
+        else:
+            canvas.create_oval(2, 2, 14, 14, fill="#d9d9d9", outline="#666666")
+
+    def _toggle_handshake_output(self, signal):
+        if self.project_settings.get("flow_control") != "manual":
+            return
+
+        widgets = self._handshake_indicators.get(signal)
+        if not widgets or not widgets.get("toggleable"):
+            return
+
+        state = self.comm_service.get_handshake_state()
+        if signal == "rts":
+            self.comm_service.set_manual_handshake(rts=not state["rts"])
+        elif signal == "dtr":
+            self.comm_service.set_manual_handshake(dtr=not state["dtr"])
+        self._refresh_handshake_indicators()
+
     def _on_close(self):
         if not self.confirm_discard_unsaved_changes():
             return
+        self._cancel_handshake_poll()
         self.stop_repeat_senders()
         self.comm_service.disconnect()
         self.destroy()
@@ -381,14 +688,73 @@ class HomePage(tk.Tk):
             matches = find_matches(
                 event.data, self._receive_rows, self._normalize_receive_row
             )
-            inline_suffix, extra_line_break = self._get_rx_inline_suffix(matches)
-            self._append_comm_data(
-                event.data,
-                "RX",
-                inline_suffix=inline_suffix,
-                extra_line_break=extra_line_break,
-            )
-            self._handle_receive_matches(matches)
+
+            if matches:
+                buffer_cursor = 0
+                is_first_chunk = True
+
+                for match in matches:
+                    # Find where this specific packet starts in the raw buffer
+                    idx = event.data.find(match.data, buffer_cursor)
+                    if idx != -1:
+                        # 1. Print any unmatched bytes (like spacing) before the packet
+                        unmatched = event.data[buffer_cursor:idx]
+                        if unmatched:
+                            self._append_comm_data(
+                                unmatched, "RX", show_header=is_first_chunk
+                            )
+                            is_first_chunk = False
+
+                        # 2. Check for checksum failures
+                        if match.checksum_ok is False:
+                            self._append_comm_line(
+                                'Checksum wrong for receive sequence "{}".'.format(match.name)
+                                
+                            )
+                            self._append_comm_data(match.data, "RX", show_header=is_first_chunk)
+                            is_first_chunk = False
+                            buffer_cursor = idx + len(match.data)
+                            continue
+
+                        # 3. Extract the comment for a successful match
+                        row = self.get_receive_row(match.row_index)
+                        action = parse_receive_action(row, match.name)
+                        comment = action.comment_text.strip() or default_comment_text(match.name)
+
+                        if action.comment_timestamp:
+                            comment = "{}  {}".format(comment, self._format_comm_timestamp())
+
+                        # 4. Print the matched packet with its attached comment
+                        inline_suffix = " {}".format(comment) if comment else ""
+                        self._append_comm_data(
+                            match.data,
+                            "RX",
+                            inline_suffix=inline_suffix,
+                            extra_line_break=False,
+                            show_header=is_first_chunk
+                        )
+                        
+                        # Advance the cursor past this packet
+                        is_first_chunk = False
+                        buffer_cursor = idx + len(match.data)
+
+                        # 5. Execute any triggered actions
+                        if self._run_receive_action(match, action):
+                            self._append_comm_line(
+                                'Communication stopped by receive sequence "{}".'.format(match.name),
+                                show_channel=False
+                            )
+                            self.routes.stop_communication()
+                            return
+
+                # 6. Dump any trailing unmatched bytes (like <CR><LF>) at the end of the buffer
+                remaining = event.data[buffer_cursor:]
+                if remaining:
+                    self._append_comm_data(remaining, "RX", show_header=is_first_chunk)
+
+            else:
+                self._append_comm_data(event.data, "RX")
+
         elif isinstance(event, ErrorEvent):
             self._append_comm_line("[ERR] {}".format(event.message), tag="error", direction="RX")
             self.routes.stop_communication()
@@ -450,13 +816,14 @@ class HomePage(tk.Tk):
         for text, _segment_tag in format_line_ending_segments(ending):
             text_widget.insert(tk.END, text, "meta")
 
-    def _append_comm_line(self, line, tag="status", direction="RX"):
+    def _append_comm_line(self, line, tag="status", direction="RX", show_channel=True):
         if not self._comm_texts:
             return
 
         def insert_lines():
             for text_widget in self._comm_texts.values():
-                self._insert_comm_header(text_widget, direction)
+                if show_channel:
+                    self._insert_comm_header(text_widget, direction)
                 text_widget.insert(tk.END, line, tag)
                 text_widget.insert(tk.END, "\n")
                 text_widget.see(tk.END)
@@ -464,23 +831,11 @@ class HomePage(tk.Tk):
         self._with_comm_text_enabled(insert_lines)
 
     def _get_rx_inline_suffix(self, matches):
-        """Comment text appended on the matched RX data line (all action types)."""
-        for match in matches:
-            if match.checksum_ok is False:
-                continue
-
-            row = self.get_receive_row(match.row_index)
-            action = parse_receive_action(row, match.name)
-            comment = action.comment_text.strip() or default_comment_text(match.name)
-            if not comment:
-                continue
-
-            if action.comment_timestamp:
-                comment = "{}  {}".format(comment, self._format_comm_timestamp())
-
-            return comment, action.comment_line_break
-
-        return "", False
+            """
+            Comment text formatting is now handled directly inside _handle_comm_event 
+            to allow line-by-line printing of burst packets.
+            """
+            return "", False
 
     def _append_comm_blank_line(self):
         if not self._comm_texts:
@@ -499,6 +854,7 @@ class HomePage(tk.Tk):
         direction,
         inline_suffix="",
         extra_line_break=False,
+        show_header=True,
     ):
         if not self._comm_texts:
             return
@@ -525,7 +881,8 @@ class HomePage(tk.Tk):
         def insert_data():
             for tab_name, text_widget in self._comm_texts.items():
                 for index, (line_bytes, ending) in enumerate(lines):
-                    if index == 0:
+                    # ONLY print the timestamp header if the flag is True
+                    if index == 0 and show_header:
                         self._insert_comm_header(text_widget, direction)
 
                     self._insert_comm_payload(text_widget, line_bytes, tab_name, data_tag)
@@ -542,6 +899,7 @@ class HomePage(tk.Tk):
                 text_widget.see(tk.END)
 
         self._with_comm_text_enabled(insert_data)
+
 
     def _handle_receive_matches(self, matches):
         for match in matches:
@@ -617,7 +975,8 @@ class HomePage(tk.Tk):
             return
 
         try:
-            self.comm_service.send_bytes(payload, label=name)
+            if not self.comm_service.send_bytes(payload, label=name):
+                return
         except Exception as exc:
             self._append_comm_line(
                 'Automatic answer for "{}" failed: {}'.format(trigger_name, exc)
@@ -631,6 +990,8 @@ class HomePage(tk.Tk):
 
         self.project_settings.update(settings)
         self.com_port.set(self.project_settings.get("channel"))
+        self.comm_service.configure_session(self.project_settings.as_dict())
+        self._update_flow_control_bar()
         self.mark_project_dirty()
 
         if was_open:
@@ -676,33 +1037,113 @@ class HomePage(tk.Tk):
         right_pane.add(script_frame, weight=1)
 
     def _build_script_editor_panel(self):
-        frame = ttk.LabelFrame(self, text="", padding=4)
+            import tksheet
+            
+            frame = ttk.LabelFrame(self, text="", padding=4)
 
-        tk.Label(
-            frame,
-            text="Script Editor",
-            font=("Segoe UI", 9, "bold"),
-        ).pack(anchor=tk.W, pady=(0, 4))
+            header = tk.Frame(frame)
+            header.pack(fill=tk.X, pady=(0, 4))
+            tk.Label(
+                header,
+                text="Script Editor",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(side=tk.LEFT)
 
-        body = tk.Frame(frame, bg="white", relief=tk.SUNKEN, bd=1)
-        body.pack(fill=tk.BOTH, expand=True)
+            # Start with a handful of blank rows so it reads as a real
+            # spreadsheet grid rather than a single empty line.
+            initial_rows = [[""] for _ in range(15)]
 
-        self._script_text = tk.Text(
-            body,
-            bg="white",
-            relief=tk.FLAT,
-            borderwidth=0,
-            wrap=tk.NONE,
-            font=("Consolas", 10),
-            padx=4,
-            pady=4,
-        )
-        scrollbar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=self._script_text.yview)
-        self._script_text.configure(yscrollcommand=scrollbar.set)
-        self._script_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            # Create the Sheet container safely matching the window backdrop
+            self._script_sheet = tksheet.Sheet(
+                frame,
+                data=initial_rows,
+                headers=["Command Script (Type, Edit, or Paste directly)"],
+                height=180,
+                enable_delete_key=True,
+                # Excel-style row numbers down the left edge
+                show_row_index=True,
+                row_index_width=40,
+                # Fix: Keep margins at 0 integer values to prevent string errors
+                empty_horizontal=0,
+                empty_vertical=0,
+                # Fix: Set the underlying canvas background color natively
+                table_background="#ffffff",
+                # Visible cell gridlines like a real spreadsheet
+                grid_color="#c0c0c0",
+                header_bg="#e8e8e8",
+                header_fg="#000000",
+                index_bg="#e8e8e8",
+                index_fg="#000000",
+            )
+            
+            # Enable all standard Excel-like interactive features
+            self._script_sheet.enable_bindings((
+                "single_select",
+                "drag_select",
+                "select_all",
+                "row_select",
+                "edit_cell",         
+                "undo",
+                "copy",
+                "paste",
+                "cut",
+                "rc_select",
+                "rc_insert_row",
+                "rc_delete_row",
+                "arrowkeys",
+                "delete",             
+                "clear_clipboard",   
+                "insert_row",        
+                "delete_row",
+                # Lets the user drag row heights / the column edge, like Excel
+                "row_height_resize",
+                "column_width_resize",
+                "double_click_column_resize",
+            ))
+            
+            self._script_sheet.column_width(column=0, width=570)
+            self._script_sheet.pack(fill=tk.BOTH, expand=True)
 
-        return frame
+            # Connect UI modifications to update the unsaved changes state flag
+            self._script_sheet.extra_bindings([
+                ("end_edit_cell", lambda event: self.mark_project_dirty()),
+                ("after_paste", lambda event: self.mark_project_dirty()),
+                ("after_delete", lambda event: self.mark_project_dirty())
+            ])
+
+            return frame
+
+    def get_script_text(self):
+        """Extracts text lines out of the single-column grid matrix sequentially."""
+        if not hasattr(self, "_script_sheet"):
+            return ""
+        
+        lines = []
+        sheet_data = self._script_sheet.get_sheet_data()
+        for row in sheet_data:
+            if row and row[0] is not None:
+                cmd_str = str(row[0]).strip()
+                if cmd_str:
+                    lines.append(cmd_str)
+        return "\n".join(lines)
+
+    def clear_script_editor(self):
+        """Resets the editor back to a single empty spreadsheet field."""
+        if hasattr(self, "_script_sheet"):
+            self._script_sheet.set_sheet_data([[""]])
+            self._script_sheet.redraw()
+
+    def focus_script_editor(self):
+        if hasattr(self, "_script_text"):
+            self._script_text.focus_set()
+
+    def clear_script_editor(self):
+            """Clear the table."""
+            if hasattr(self, "_script_tree"):
+                for item in self._script_tree.get_children():
+                    self._script_tree.delete(item)
+                self._script_entry.delete(0, tk.END)
+                self._script_entry.focus_set()
 
     def _build_send_sequences(self):
         frame = ttk.LabelFrame(self, text="", padding=4)
@@ -825,7 +1266,8 @@ class HomePage(tk.Tk):
             return False
 
         try:
-            self.comm_service.send_bytes(payload, label=name)
+            if not self.comm_service.send_bytes(payload, label=name):
+                return False
         except Exception as exc:
             if from_repeat:
                 self._append_comm_line(

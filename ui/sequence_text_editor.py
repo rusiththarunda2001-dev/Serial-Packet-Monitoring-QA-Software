@@ -234,34 +234,42 @@ class SequenceTextEditor(tk.Frame):
         return len(self.seq_text.get("1.0", tk.INSERT))
 
     def _on_right_arrow(self):
-        cell_text = self._current_cell_text()
-        mode = self.get_display_mode()
-        offset = self._cursor_offset()
-        text = self.seq_text.get("1.0", "1.0 lineend")
-        rest = text[offset:]
-        before = self.seq_text.get("1.0", tk.INSERT)
-        cell_start = before.rfind(CELL_SEP) + 1
-        pos_in_cell = len(before) - cell_start
+            offset = self._cursor_offset()
+            text = self.seq_text.get("1.0", "1.0 lineend")
+            rest = text[offset:]
 
-        if not self._is_cell_complete(cell_text, mode):
-            if pos_in_cell < len(cell_text):
-                self.seq_text.mark_set(tk.INSERT, "1.0+{}c".format(offset + 1))
-            self._update_position_label()
-            return
+            # --- FIX FOR DECIMAL MODE AUTO-CELL CREATION ---
+            # If we are at the absolute end of the text line, create a new cell partition
+            if not rest:
+                # Check if there is text before us and it doesn't already end in a pipe
+                before = self.seq_text.get("1.0", tk.INSERT)
+                if before and not before.endswith(CELL_SEP):
+                    self.seq_text.insert(tk.INSERT, CELL_SEP)
+                    self._update_position_label()
+                    self._notify_change()
+                return
 
-        if rest.startswith(CELL_SEP):
-            self.seq_text.mark_set(tk.INSERT, "1.0+{}c".format(offset + len(CELL_SEP)))
-        else:
+            # Find the next pipe in the text to the right
             pipe_pos = rest.find(CELL_SEP)
+
             if pipe_pos >= 0:
+                # Jump the cursor past the next pipe (to the start of the next cell)
                 self.seq_text.mark_set(
                     tk.INSERT,
-                    "1.0+{}c".format(offset + pipe_pos + len(CELL_SEP)),
+                    "1.0+{}c".format(offset + pipe_pos + len(CELL_SEP))
                 )
+                
+                # Special adjustment: If we just jumped over a pipe and landed at the absolute 
+                # end of the line (e.g., matching the trailing pipe structure '255|'), 
+                # hitting right arrow again can prepare an entirely new active empty cell block.
+                new_offset = self._cursor_offset()
+                if new_offset == len(text) and text.endswith(CELL_SEP):
+                    pass 
             else:
-                self.seq_text.insert(tk.INSERT, CELL_SEP)
+                # If there are no more pipes, just move to the end of the line
+                self.seq_text.mark_set(tk.INSERT, "1.0 lineend")
 
-        self._update_position_label()
+            self._update_position_label()
 
     def _on_left_arrow(self):
         before = self.seq_text.get("1.0", tk.INSERT)
@@ -280,9 +288,66 @@ class SequenceTextEditor(tk.Frame):
 
         self._update_position_label()
 
-    def _on_text_changed(self, _event=None):
+    def _on_backspace(self):
+        before = self.seq_text.get("1.0", tk.INSERT)
+        offset = len(before)
+
+        if offset == 0:
+            return
+
+        if before.endswith(CELL_SEP):
+            pipe_pos = offset - len(CELL_SEP)
+            if pipe_pos == 0:
+                self.seq_text.delete("1.0", tk.INSERT)
+                self.seq_text.mark_set(tk.INSERT, "1.0")
+            else:
+                prev_pipe = before.rfind(CELL_SEP, 0, pipe_pos)
+                cell_start = prev_pipe + 1
+                self.seq_text.delete("1.0+{}c".format(cell_start), "1.0+{}c".format(offset))
+                if prev_pipe >= 0:
+                    self.seq_text.mark_set(tk.INSERT, "1.0+{}c".format(prev_pipe + 1))
+                else:
+                    self.seq_text.mark_set(tk.INSERT, "1.0")
+            self._update_position_label()
+            self._notify_change()
+            return
+
+        last_pipe = before.rfind(CELL_SEP)
+        cell_start = last_pipe + 1
+        if offset <= cell_start:
+            self._update_position_label()
+            return
+
+        mode = self.get_display_mode()
+        cell_text = before[cell_start:]
+
+        if (
+            mode != "ASCII"
+            and not PLACEHOLDER_PATTERN.match(cell_text)
+            and len(cell_text) > 1
+        ):
+            self.seq_text.delete("1.0+{}c".format(offset - 1), tk.INSERT)
+        else:
+            self.seq_text.delete("1.0+{}c".format(cell_start), tk.INSERT)
+
         self._update_position_label()
         self._notify_change()
+
+    def _on_text_changed(self, _event=None):
+            # --- AUTO-SNAP CURSOR TO LEFT OF CHARACTER (ASCII ONLY) ---
+            if self.get_display_mode() == "ASCII":
+                # Get the character directly to the left of the current cursor position
+                left_char = self.seq_text.get("insert - 1c")
+                
+                # If the cursor is sitting to the right of a regular character (and not a pipe symbol)
+                if left_char and left_char != CELL_SEP and left_char != "\n":
+                    current_pos = self.seq_text.index(tk.INSERT)
+                    # Automatically snap the cursor position back 1 character to the left side
+                    self.seq_text.mark_set(tk.INSERT, f"{current_pos} - 1c")
+
+            # Keep the original workflow intact
+            self._update_position_label()
+            self._notify_change()
 
     def _block_newline(self, _event=None):
         return "break"
@@ -298,7 +363,11 @@ class SequenceTextEditor(tk.Frame):
             self._on_left_arrow()
             return "break"
 
-        if event.keysym in ("BackSpace", "Delete", "Up", "Down", "Home", "End"):
+        if event.keysym == "BackSpace":
+            self._on_backspace()
+            return "break"
+
+        if event.keysym in ("Delete", "Up", "Down", "Home", "End"):
             return
 
         if event.state & 0x4:

@@ -34,8 +34,10 @@ def find_matches(
     receive_rows: list,
     normalize_row,
 ) -> List[ReceiveMatch]:
-    """Return receive-sequence hits for one RX frame."""
+    """Return receive-sequence hits for one RX frame, matching recursively."""
     matches: List[ReceiveMatch] = []
+    if not data:
+        return matches
 
     for row_index, row in enumerate(receive_rows):
         active, name, sequence, checksum_rule, detect_mode, *_ = normalize_row(row)
@@ -49,31 +51,62 @@ def find_matches(
         except SequenceEncodeError:
             continue
 
+        if not pattern:
+            continue
+
         rule_id = parse_rule(checksum_rule)
+
+        # -----------------------------------------------------------------
+        # MODE 1: Checksum is OFF (Find EVERY occurrence inside the buffer)
+        # -----------------------------------------------------------------
         if rule_id == "off":
-            if data == pattern or pattern in data:
+            search_start = 0
+            while True:
+                # Look for the pattern string anywhere in the remaining buffer
+                idx = data.find(pattern, search_start)
+                if idx == -1:
+                    break  # No more matches in this buffer
+                
                 matches.append(
                     ReceiveMatch(
                         name=name,
-                        data=data,
+                        data=pattern,  # Isolate just the matched token packet
                         checksum_ok=None,
                         row_index=row_index,
                     )
                 )
+                # Advance search index past this match to find subsequent ones
+                search_start = idx + len(pattern)
             continue
 
-        if not (data.startswith(pattern) and len(data) >= len(pattern) + 1):
-            continue
-
-        checksum_ok = verify_checksum(data, checksum_rule)
-        if _checksum_accepted(checksum_ok, detect_mode):
-            matches.append(
-                ReceiveMatch(
-                    name=name,
-                    data=data,
-                    checksum_ok=checksum_ok,
-                    row_index=row_index,
+        # -----------------------------------------------------------------
+        # MODE 2: Checksum is ON (Scan through buffer parsing frame segments)
+        # -----------------------------------------------------------------
+        search_start = 0
+        while search_start < len(data):
+            # Look for where the frame header sequence starts
+            idx = data.find(pattern, search_start)
+            if idx == -1:
+                break
+            
+            # Slice the remaining data starting from this pattern detection header
+            sub_data = data[idx:]
+            if len(sub_data) < len(pattern) + 1:
+                break  # Too short to contain a valid checksum payload
+            
+            # Validate checksum over this individual chunk segment
+            checksum_ok = verify_checksum(sub_data, checksum_rule)
+            if _checksum_accepted(checksum_ok, detect_mode):
+                matches.append(
+                    ReceiveMatch(
+                        name=name,
+                        data=sub_data,
+                        checksum_ok=checksum_ok,
+                        row_index=row_index,
+                    )
                 )
-            )
+            
+            # Advance past this frame header sequence to keep scanning for more packets
+            search_start = idx + len(pattern)
 
     return matches

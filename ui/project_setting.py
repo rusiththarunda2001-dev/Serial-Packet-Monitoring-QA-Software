@@ -359,16 +359,6 @@ class ProjectSetting(tk.Toplevel):
             alias_entry.grid(row=0, column=2, sticky=tk.EW)
             self.channel_alias_entries.append(alias_entry)
 
-        scripting_link = tk.Label(
-            parent,
-            text="Use Docklight Scripting for advanced contents processing",
-            bg="#f0f0f0",
-            fg="#1a5fb4",
-            font=("Segoe UI", 9, "underline"),
-            cursor="hand2",
-        )
-        scripting_link.pack(anchor=tk.W, pady=(4, 0))
-
     def _refresh_channel_ports(self, selected_channel=None):
         channel = (selected_channel or self.channel_combo.get() or "COM1").strip()
         ports = list_available_ports(include=channel)
@@ -436,7 +426,7 @@ class ProjectSetting(tk.Toplevel):
 
 
 if __name__ == "__main__":
-    from project_settings import ProjectSettings
+    from core.settings_saver import ProjectSettings
 
     root = tk.Tk()
     root.withdraw()
