@@ -9,13 +9,13 @@ class CustomScriptCommands:
     def __init__(self, home_page):
         self.home = home_page
 
-    def Delay(self, milliseconds):
-        """Delays the script execution for the specified time in milliseconds."""
+    def Pause(self, milliseconds):
+        """Pauses the script execution for the specified time in milliseconds."""
         try:
             freq_ms = int(milliseconds)
         except ValueError:
             self.home.after(0, lambda: self.home._append_comm_line(
-                "Delay Error: Time must be an integer representing milliseconds.", 
+                "Pause Error: Time must be an integer representing milliseconds.", 
                 tag="error", show_channel=False
             ))
             return
@@ -177,7 +177,7 @@ def run_script(script_text, home_page):
                 "StopCommunication": commands.StopCommunication,
                 "Createlog": commands.Createlog,
                 "ClearScreen": commands.ClearScreen,
-                "Delay": commands.Delay,
+                "Pause": commands.Pause,
                 "__builtins__": __builtins__
             }
 
