@@ -359,7 +359,21 @@ class CommService:
                 size = waiting if waiting > 0 else 1
                 chunk = port.read(size)
             except serial.SerialException as exc:
-                self._on_event(ErrorEvent(message=str(exc)))
+                message = str(exc)
+                lowered_message = message.lower()
+                if "clearcommerror failed" in lowered_message and (
+                    "permissionerror" in lowered_message
+                    or "access is denied" in lowered_message
+                ):
+                    message = (
+                        "Serial connection to {} was lost or became unavailable. "
+                        "Check the USB device and reconnect the port."
+                    ).format(port.port)
+                else:
+                    message = "Serial communication error on {}: {}".format(
+                        port.port, message
+                    )
+                self._on_event(ErrorEvent(message=message))
                 break
 
             if chunk:

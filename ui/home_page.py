@@ -2,6 +2,8 @@
 
 from datetime import datetime
 from pathlib import Path
+import threading
+import time
 import tksheet
 
 import tkinter as tk
@@ -38,6 +40,7 @@ from core.sequence_codec import (
 from core.settings_saver import ProjectSettings
 from route.routes import Routes
 from ui.edit_receive_sequence import DEFAULT_CHECKSUM_DETECT
+from ui.chatbot_window import ChatbotPanel
 
 
 _FLOW_CONTROL_BAR_LABELS = {
@@ -57,6 +60,8 @@ class HomePage(tk.Tk):
 
         self._send_rows = []
         self._receive_rows = []
+        self._receive_wait_condition = threading.Condition()
+        self._receive_sequence_waiters = []
         self._send_buttons = {}
         self._repeat_after_ids = {}
         self._global_display_mode = "HEX"
@@ -73,6 +78,7 @@ class HomePage(tk.Tk):
         self._handshake_indicators = {}
         self.comm_service = CommService(self._on_comm_event)
         self.routes = Routes(self)
+        self._keyboard_buffer = ""
 
         self._build_menu()
         self._build_toolbar()
@@ -181,6 +187,7 @@ class HomePage(tk.Tk):
                 toolbar,
                 self._draw_play_icon,
                 self.routes.start_communication,
+                tooltip="Start Communication",
             )
             play_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
 
@@ -188,47 +195,58 @@ class HomePage(tk.Tk):
                 toolbar,
                 self._draw_stop_icon,
                 self.routes.stop_communication,
+                tooltip="Stop Communication",
             )
             stop_btn.pack(side=tk.LEFT, padx=(2, 0), pady=2)
 
-            edit_btn = self._toolbar_image_button(
-                toolbar, "edit_script.png", self.routes.edit_script
-            )
-            edit_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
+            # edit_btn = self._toolbar_image_button(
+            #     toolbar, "edit_script.png", self.routes.edit_script
+            # )
+            # edit_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
 
             keyboard_btn, keyboard_canvas = self._toolbar_icon_button(
                 toolbar,
                 self._draw_keyboard_icon,
                 self.routes.toggle_keyboard_console,
                 return_canvas=True,
+                tooltip="Keyboard Console",
             )
             keyboard_btn.pack(side=tk.LEFT, padx=(2, 6), pady=2)
             self._keyboard_console_canvas = keyboard_canvas
 
+            chatbot_btn = self._toolbar_image_button(
+                toolbar,
+                "chat-bot.png",
+                self._toggle_chatbot_panel,
+                max_size=24,
+                tooltip="Show or hide Chatbot",
+            )
+            chatbot_btn.pack(side=tk.LEFT, padx=(0, 6), pady=2)
+
     # --- NEW SCRIPTING BUTTONS ---
             tk.Frame(toolbar, width=8, bg="#d4d0c8").pack(side=tk.LEFT)
 
-            self._btn_script_play = self._toolbar_image_button(
-                toolbar, 
-                "play.png", 
-                self._on_script_play, 
-                disabled_image_name="play_disabled.png"
+            self._btn_script_play = self._toolbar_text_button(
+                toolbar,
+                "Script Play",
+                self._on_script_play,
+                tooltip="Run or resume the script",
             )
             self._btn_script_play.pack(side=tk.LEFT, padx=(2, 0), pady=2)
 
-            self._btn_script_pause = self._toolbar_image_button(
-                toolbar, 
-                "pause.png", 
-                self._on_script_pause, 
-                disabled_image_name="pause_disabled.png"
+            self._btn_script_pause = self._toolbar_text_button(
+                toolbar,
+                "Script Pause",
+                self._on_script_pause,
+                tooltip="Pause the running script",
             )
             self._btn_script_pause.pack(side=tk.LEFT, padx=(2, 0), pady=2)
 
-            self._btn_script_stop = self._toolbar_image_button(
-                toolbar, 
-                "stop.png", 
-                self._on_script_stop, 
-                disabled_image_name="stop_disabled.png"
+            self._btn_script_stop = self._toolbar_text_button(
+                toolbar,
+                "Script Stop",
+                self._on_script_stop,
+                tooltip="Stop the script and communication",
             )
             self._btn_script_stop.pack(side=tk.LEFT, padx=(2, 0), pady=2)
 
@@ -237,13 +255,24 @@ class HomePage(tk.Tk):
             self._btn_script_pause.set_state(False)
             self._btn_script_stop.set_state(False)
 
-    def _load_toolbar_image(self, filename):
+            
+
+    def _load_toolbar_image(self, filename, max_size=None):
             path = Path(__file__).resolve().parent / "assets" / "toolbar" / filename
             image = tk.PhotoImage(file=str(path))
+            if max_size:
+                scale = max(
+                    1,
+                    (max(image.width(), image.height()) + max_size - 1) // max_size,
+                )
+                if scale > 1:
+                    image = image.subsample(scale, scale)
             self._toolbar_images.append(image)
             return image
 
-    def _toolbar_icon_button(self, parent, draw_icon, command, return_canvas=False):
+    def _toolbar_icon_button(
+        self, parent, draw_icon, command, return_canvas=False, tooltip=None
+    ):
         normal_bg = "#d4d0c8"
         hover_bg = "#b8b4ac"
 
@@ -274,22 +303,106 @@ class HomePage(tk.Tk):
             widget.bind("<Button-1>", on_click)
             widget.bind("<Enter>", on_enter)
             widget.bind("<Leave>", on_leave)
+            if tooltip:
+                self._attach_toolbar_tooltip(widget, tooltip)
 
         if return_canvas:
             return frame, canvas
         return frame
 
 
+    def _toolbar_text_button(self, parent, text, command, tooltip=None):
+            state = {"enabled": True}
 
-    def _toolbar_image_button(self, parent, image_name, command, disabled_image_name=None):
+            def safe_command():
+                if state["enabled"]:
+                    command()
+
+            button = tk.Button(
+                parent,
+                text=text,
+                command=safe_command,
+                relief=tk.RAISED,
+                padx=6,
+                cursor="hand2",
+            )
+
+            def set_state(enabled):
+                state["enabled"] = enabled
+                button.configure(
+                    state=tk.NORMAL if enabled else tk.DISABLED,
+                    cursor="hand2" if enabled else "arrow",
+                )
+
+            button.set_state = set_state
+            if tooltip:
+                self._attach_toolbar_tooltip(button, tooltip)
+            return button
+
+
+    def _attach_toolbar_tooltip(self, widget, text):
+            tooltip_state = {"after_id": None, "window": None}
+
+            def show_tooltip():
+                tooltip_state["after_id"] = None
+                if not widget.winfo_exists() or tooltip_state["window"]:
+                    return
+
+                x = widget.winfo_rootx() + 8
+                y = widget.winfo_rooty() + widget.winfo_height() + 4
+                window = tk.Toplevel(widget)
+                window.wm_overrideredirect(True)
+                window.wm_geometry("+{}+{}".format(x, y))
+                tk.Label(
+                    window,
+                    text=text,
+                    bg="#fffbd6",
+                    relief=tk.SOLID,
+                    borderwidth=1,
+                    padx=5,
+                    pady=2,
+                    font=("Segoe UI", 8),
+                ).pack()
+                tooltip_state["window"] = window
+
+            def schedule_tooltip(_event=None):
+                if tooltip_state["after_id"] is None:
+                    tooltip_state["after_id"] = widget.after(500, show_tooltip)
+
+            def hide_tooltip(_event=None):
+                after_id = tooltip_state["after_id"]
+                if after_id is not None:
+                    widget.after_cancel(after_id)
+                    tooltip_state["after_id"] = None
+                window = tooltip_state["window"]
+                if window is not None:
+                    window.destroy()
+                    tooltip_state["window"] = None
+
+            widget.bind("<Enter>", schedule_tooltip, add="+")
+            widget.bind("<Leave>", hide_tooltip, add="+")
+            widget.bind("<ButtonPress>", hide_tooltip, add="+")
+
+
+    def _toolbar_image_button(
+        self,
+        parent,
+        image_name,
+        command,
+        disabled_image_name=None,
+        max_size=None,
+        tooltip=None,
+    ):
             normal_bg = "#d4d0c8"
             hover_bg = "#b8b4ac"
             click_bg = "#a0a0a0"
             
             # Load the normal image, and the disabled image if one was provided
-            image_active = self._load_toolbar_image(image_name)
+            image_active = self._load_toolbar_image(image_name, max_size=max_size)
             if disabled_image_name:
-                image_disabled = self._load_toolbar_image(disabled_image_name)
+                image_disabled = self._load_toolbar_image(
+                    disabled_image_name, max_size=max_size
+                )
             else:
                 image_disabled = image_active  # Fallback if no disabled image is provided
 
@@ -338,6 +451,8 @@ class HomePage(tk.Tk):
             btn.bind("<Leave>", on_leave)
 
             btn.set_state = set_state
+            if tooltip:
+                self._attach_toolbar_tooltip(btn, tooltip)
             return btn
     def _on_script_play(self):
             # If the script was previously paused, resume it
@@ -396,17 +511,14 @@ class HomePage(tk.Tk):
         canvas.create_rectangle(
             8, 8, 16, 16, fill="#808080", outline="#505050", width=1
         )
-    
 
-    @staticmethod
-    def _draw_keyboard_icon(canvas, active=False):
+    def _draw_keyboard_icon(self, canvas, active=False):
         canvas.delete("all")
-        body_fill = "#9a9a9a" if active else "#c0c0c0"
-        canvas.create_rectangle(4, 10, 20, 18, fill=body_fill, outline="#000000", width=1)
-        for x in (7, 10, 13, 16):
-            canvas.create_rectangle(x, 12, x + 2, 14, fill="#ffffff", outline="")
-            canvas.create_rectangle(x, 15, x + 2, 17, fill="#ffffff", outline="")
-        canvas.create_line(4, 10, 4, 7, 7, 5, 10, 4, 13, 6, fill="#000000", width=1)
+        if not hasattr(self, "_keyboard_icon_image"):
+            self._keyboard_icon_image = self._load_toolbar_image(
+                "keyboard.png", max_size=24
+            )
+        canvas.create_image(12, 12, image=self._keyboard_icon_image)
 
     def set_keyboard_console_enabled(self, enabled):
         enabled = bool(enabled)
@@ -414,6 +526,7 @@ class HomePage(tk.Tk):
             return
 
         self._keyboard_console_enabled = enabled
+        self._keyboard_buffer = ""
         self._update_keyboard_console_bindings()
         self._update_keyboard_console_button()
         if enabled:
@@ -488,21 +601,29 @@ class HomePage(tk.Tk):
         if not self._keyboard_console_enabled or not self.comm_service.is_connected():
             return "break"
 
-        payload = self._keyboard_event_to_bytes(event)
-        if payload is None:
-            return "break"
-        if not payload:
+        widget = event.widget
+
+        if event.keysym in ("Return", "KP_Enter"):
+            text = self._keyboard_buffer
+            if text:
+                payload = text.encode("latin-1", errors="replace")
+                self.comm_service.send_bytes(payload, label="Keyboard")
+                widget.insert(tk.END, "\n")
+                self._keyboard_buffer = ""
             return "break"
 
-        try:
-            if not self.comm_service.send_bytes(payload, label="Keyboard"):
-                return "break"
-        except Exception as exc:
-            messagebox.showerror(
-                "Keyboard Console",
-                "Could not send keyboard input:\n{}".format(exc),
-                parent=self,
-            )
+        if event.keysym == "BackSpace":
+            if self._keyboard_buffer:
+                self._keyboard_buffer = self._keyboard_buffer[:-1]
+                widget.delete("insert-1c", tk.INSERT)
+            return "break"
+
+        if event.char and event.char not in ("\r", "\n"):
+            self._keyboard_buffer += event.char
+            widget.insert(tk.INSERT, event.char)
+            widget.mark_set(tk.INSERT, tk.END)
+            return "break"
+
         return "break"
 
     def _with_comm_text_enabled(self, callback):
@@ -688,6 +809,7 @@ class HomePage(tk.Tk):
             matches = find_matches(
                 event.data, self._receive_rows, self._normalize_receive_row
             )
+            self._notify_receive_sequence_waiters(matches)
 
             if matches:
                 buffer_cursor = 0
@@ -758,6 +880,114 @@ class HomePage(tk.Tk):
         elif isinstance(event, ErrorEvent):
             self._append_comm_line("[ERR] {}".format(event.message), tag="error", direction="RX")
             self.routes.stop_communication()
+
+    def _notify_receive_sequence_waiters(self, matches):
+        if not matches:
+            return
+
+        with self._receive_wait_condition:
+            for match in matches:
+                for waiter in self._receive_sequence_waiters:
+                    if waiter["row_index"] == match.row_index:
+                        if waiter["max_counter"] == -1:
+                            waiter["count"] += 1
+                        else:
+                            waiter["count"] = min(
+                                waiter["max_counter"], waiter["count"] + 1
+                            )
+            self._receive_wait_condition.notify_all()
+
+    def wait_for_receive_sequence(self, name_or_index, max_counter=1, timeout=-1):
+        if isinstance(name_or_index, bool):
+            raise ValueError("Receive sequence must be a name or zero-based index.")
+
+        if isinstance(name_or_index, int):
+            row_index = name_or_index
+            if not (0 <= row_index < len(self._receive_rows)):
+                raise ValueError("Receive sequence index is out of range.")
+        elif isinstance(name_or_index, str):
+            row_index = next(
+                (
+                    index
+                    for index, row in enumerate(self._receive_rows)
+                    if self._normalize_receive_row(row)[1] == name_or_index
+                ),
+                None,
+            )
+            if row_index is None:
+                raise ValueError(
+                    'Receive sequence "{}" was not found.'.format(name_or_index)
+                )
+        else:
+            raise ValueError("Receive sequence must be a name or zero-based index.")
+
+        row = self.get_receive_row(row_index)
+        if row[0] != "☑":
+            raise ValueError('Receive sequence "{}" is inactive.'.format(row[1]))
+
+        if isinstance(max_counter, bool) or isinstance(timeout, bool):
+            raise ValueError("maxCounter and timeout must be integer values.")
+        try:
+            max_counter = int(max_counter)
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            raise ValueError("maxCounter and timeout must be integer values.")
+        if max_counter == 0 or max_counter < -1:
+            raise ValueError("maxCounter must be positive or -1.")
+        if timeout < -1:
+            raise ValueError("timeout must be non-negative or -1.")
+
+        deadline = None if timeout == -1 else time.monotonic() + timeout / 1000.0
+        waiter = {
+            "row_index": row_index,
+            "max_counter": max_counter,
+            "count": 0,
+        }
+        with self._receive_wait_condition:
+            self._receive_sequence_waiters.append(waiter)
+
+        try:
+            if not self.comm_service.is_connected():
+                communication_started = threading.Event()
+
+                def start_communication():
+                    try:
+                        if not getattr(self, "_script_stopped", False):
+                            self.routes.start_communication()
+                    finally:
+                        communication_started.set()
+
+                self.after(0, start_communication)
+                while not communication_started.wait(0.1):
+                    if getattr(self, "_script_stopped", False):
+                        raise SystemExit()
+                if getattr(self, "_script_stopped", False):
+                    raise SystemExit()
+                if not self.comm_service.is_connected():
+                    raise RuntimeError("Could not start serial communication.")
+
+            with self._receive_wait_condition:
+                while True:
+                    if max_counter != -1 and waiter["count"] >= max_counter:
+                        return waiter["count"]
+                    if getattr(self, "_script_stopped", False):
+                        raise SystemExit()
+                    if not self.comm_service.is_connected():
+                        raise RuntimeError(
+                            "Communication stopped while waiting for a receive sequence."
+                        )
+
+                    wait_time = 0.1
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            return waiter["count"]
+                        wait_time = min(wait_time, remaining)
+                    self._receive_wait_condition.wait(wait_time)
+        finally:
+            with self._receive_wait_condition:
+                if waiter in self._receive_sequence_waiters:
+                    self._receive_sequence_waiters.remove(waiter)
 
     @staticmethod
     def _format_comm_timestamp():
@@ -1010,15 +1240,18 @@ class HomePage(tk.Tk):
         com_frame = tk.Frame(top_bar, bg="#d9d9d9")
         com_frame.pack(side=tk.RIGHT)
         self.com_port = tk.StringVar(value=self.project_settings.get("channel"))
-        ttk.Button(
+        settings_button = ttk.Button(
             com_frame,
             textvariable=self.com_port,
             width=10,
             command=self.routes.open_project_settings,
-        ).pack()
+        )
+        settings_button.pack()
+        self._attach_toolbar_tooltip(settings_button, "Project Communication Settings")
 
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._main_paned = paned
 
         left_pane = ttk.PanedWindow(paned, orient=tk.VERTICAL)
         paned.add(left_pane, weight=1)
@@ -1035,6 +1268,20 @@ class HomePage(tk.Tk):
         script_frame = self._build_script_editor_panel()
         right_pane.add(comm_frame, weight=3)
         right_pane.add(script_frame, weight=1)
+
+        self._chatbot_panel = ChatbotPanel(paned)
+
+    def _toggle_chatbot_panel(self):
+        if str(self._chatbot_panel) in self._main_paned.panes():
+            self._hide_chatbot_panel()
+            return
+
+        self._main_paned.add(self._chatbot_panel, weight=1)
+        self._chatbot_panel.focus_message_entry()
+
+    def _hide_chatbot_panel(self):
+        if str(self._chatbot_panel) in self._main_paned.panes():
+            self._main_paned.forget(self._chatbot_panel)
 
     def _build_script_editor_panel(self):
             import tksheet
@@ -1117,6 +1364,8 @@ class HomePage(tk.Tk):
         """Extracts text lines out of the single-column grid matrix sequentially."""
         if not hasattr(self, "_script_sheet"):
             return ""
+
+        self._script_sheet.close_text_editor(set_data=True)
         
         lines = []
         sheet_data = self._script_sheet.get_sheet_data()
@@ -1156,9 +1405,11 @@ class HomePage(tk.Tk):
             bg="#d9d9d9",
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT)
-        ttk.Button(header, text="Add Sequence", command=self.routes.add_send_sequence).pack(
-            side=tk.RIGHT
+        add_send_button = ttk.Button(
+            header, text="Add Sequence", command=self.routes.add_send_sequence
         )
+        add_send_button.pack(side=tk.RIGHT)
+        self._attach_toolbar_tooltip(add_send_button, "Add Send Sequence")
 
         table_frame = tk.Frame(frame)
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -1217,6 +1468,7 @@ class HomePage(tk.Tk):
                 width=2,
                 command=lambda row_id=item: self._send_sequence(row_id),
             )
+            self._attach_toolbar_tooltip(button, "Send Sequence")
             button.place(x=x, y=y, width=max(width, 28), height=height)
             self._send_buttons[item] = button
 
@@ -1579,9 +1831,11 @@ class HomePage(tk.Tk):
             bg="#d9d9d9",
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT)
-        ttk.Button(header, text="Add Sequence", command=self.routes.add_receive_sequence).pack(
-            side=tk.RIGHT
+        add_receive_button = ttk.Button(
+            header, text="Add Sequence", command=self.routes.add_receive_sequence
         )
+        add_receive_button.pack(side=tk.RIGHT)
+        self._attach_toolbar_tooltip(add_receive_button, "Add Receive Sequence")
 
         table_frame = tk.Frame(frame)
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -1628,12 +1882,14 @@ class HomePage(tk.Tk):
         tk.Label(header, text="Communication", font=("Segoe UI", 9, "bold")).pack(
             side=tk.RIGHT
         )
-        ttk.Button(
+        clear_button = ttk.Button(
             header,
             text="Clear",
             width=8,
             command=self._clear_communication_panel,
-        ).pack(side=tk.RIGHT, padx=(0, 8))
+        )
+        clear_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self._attach_toolbar_tooltip(clear_button, "Clear Communication Display")
 
         notebook = ttk.Notebook(frame)
         self._comm_notebook = notebook

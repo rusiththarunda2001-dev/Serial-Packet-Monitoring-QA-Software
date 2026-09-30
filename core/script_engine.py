@@ -2,7 +2,32 @@
 
 import threading
 import time
+import traceback
 import tkinter.messagebox as messagebox
+
+
+def _format_script_error(error):
+    if isinstance(error, (NameError, SyntaxError)):
+        return "[ERR] Invalid command"
+
+    if isinstance(error, SyntaxError):
+        line_number = error.lineno
+        description = "Script syntax error"
+        details = error.msg
+    else:
+        script_frames = [
+            frame
+            for frame in traceback.extract_tb(error.__traceback__)
+            if frame.filename == "<string>"
+        ]
+        line_number = script_frames[-1].lineno if script_frames else None
+        description = "Script error"
+        details = str(error)
+
+    if line_number is not None:
+        return "{} on line {}: {}".format(description, line_number, details)
+    return "{}: {}".format(description, details)
+
 
 class CustomScriptCommands:
     """Provides the 5 specific custom commands to the execution environment."""
@@ -118,6 +143,14 @@ class CustomScriptCommands:
         """Opens the COM port."""
         self.home.after(0, self.home.routes.start_communication)
 
+    def WaitForSequence(self, nameOrIndex, maxCounter=1, timeout=-1):
+        """Wait for an active receive sequence and return its detected count."""
+        return self.home.wait_for_receive_sequence(
+            nameOrIndex,
+            max_counter=maxCounter,
+            timeout=timeout,
+        )
+
     def StopCommunication(self):
         """Closes the COM port."""
         self.home.after(0, self.home.routes.stop_communication)
@@ -175,6 +208,7 @@ def run_script(script_text, home_page):
                 "SendSequence": commands.SendSequence,
                 "StartCommunication": commands.StartCommunication,
                 "StopCommunication": commands.StopCommunication,
+                "WaitForSequence": commands.WaitForSequence,
                 "Createlog": commands.Createlog,
                 "ClearScreen": commands.ClearScreen,
                 "Pause": commands.Pause,
@@ -187,9 +221,11 @@ def run_script(script_text, home_page):
             # Silent termination catch
             pass
         except Exception as e:
-            error_message = str(e)
+            error_message = _format_script_error(e)
+            if not isinstance(e, (NameError, SyntaxError)):
+                error_message = "Script Engine Error: {}".format(error_message)
             home_page.after(0, lambda msg=error_message: home_page._append_comm_line(
-                f"Script Engine Error: {msg}", tag="error", direction="TX", show_channel=False
+                msg, tag="error", direction="TX", show_channel=False
             ))
         finally:
             def _ui_finish():

@@ -204,6 +204,7 @@ class SequenceTextEditor(tk.Frame):
             return line_text
         return line_text[last_sep + 1 :]
 
+
     def _update_position_label(self):
         content = self.seq_text.get("1.0", tk.INSERT)
         before_cursor = content.split(CELL_SEP)
@@ -320,6 +321,29 @@ class SequenceTextEditor(tk.Frame):
 
         mode = self.get_display_mode()
         cell_text = before[cell_start:]
+        next_char = self.seq_text.get(
+            "1.0+{}c".format(offset), "1.0+{}c".format(offset + 1)
+        )
+
+        if mode == "HEX" and next_char == CELL_SEP and len(cell_text) == 1:
+            self.seq_text.delete(
+                "1.0+{}c".format(cell_start),
+                "1.0+{}c".format(offset + 1),
+            )
+            self.seq_text.mark_set(tk.INSERT, "1.0+{}c".format(cell_start))
+            self._update_position_label()
+            self._notify_change()
+            return
+
+        if mode in ("HEX", "Decimal", "Binary") and next_char == CELL_SEP and len(cell_text) == 1:
+            self.seq_text.delete(
+                "1.0+{}c".format(cell_start),
+                "1.0+{}c".format(offset + 1),
+            )
+            self.seq_text.mark_set(tk.INSERT, "1.0+{}c".format(cell_start))
+            self._update_position_label()
+            self._notify_change()
+            return
 
         if (
             mode != "ASCII"
@@ -343,7 +367,7 @@ class SequenceTextEditor(tk.Frame):
                 if left_char and left_char != CELL_SEP and left_char != "\n":
                     current_pos = self.seq_text.index(tk.INSERT)
                     # Automatically snap the cursor position back 1 character to the left side
-                    self.seq_text.mark_set(tk.INSERT, f"{current_pos} - 1c")
+                    self.seq_text.mark_set(tk.INSERT, "{} - 1c".format(current_pos))
 
             # Keep the original workflow intact
             self._update_position_label()
@@ -353,7 +377,7 @@ class SequenceTextEditor(tk.Frame):
         return "break"
 
     def _handle_keypress(self, event):
-        if event.keysym in ("Return", "KP_Enter"):
+        if event.keysym in ("Return", "KP_Enter","Tab"):
             return "break"
 
         if event.keysym == "Right":
@@ -384,30 +408,41 @@ class SequenceTextEditor(tk.Frame):
 
         if mode == "ASCII":
             self.seq_text.insert(tk.INSERT, event.char + CELL_SEP)
+            
             return "break"
 
         if mode == "HEX":
             if event.char.upper() not in "0123456789ABCDEF":
                 return "break"
-            if len(cell_text) == 1:
-                self.seq_text.insert(tk.INSERT, event.char.upper() + CELL_SEP)
-            else:
-                self.seq_text.insert(tk.INSERT, event.char.upper())
+            if len(cell_text) >= 2:
+                return "break"
+
+            self.seq_text.insert(tk.INSERT, event.char.upper())
+            if len(self._current_cell_text()) >= 2:
+                self.seq_text.insert(tk.INSERT, CELL_SEP)
+
+            self._update_position_label()
+            self._notify_change()
             return "break"
 
         if mode == "Binary":
             if event.char not in "01":
                 return "break"
-            if len(cell_text) == 7:
-                self.seq_text.insert(tk.INSERT, event.char + CELL_SEP)
-            else:
-                self.seq_text.insert(tk.INSERT, event.char)
+            if len(cell_text) >= 8:
+                return "break"
+
+            self.seq_text.insert(tk.INSERT, event.char)
+            if len(self._current_cell_text()) >= 8:
+                self.seq_text.insert(tk.INSERT, CELL_SEP)
+
             return "break"
 
         if mode == "Decimal":
             if event.char == " ":
                 return "break"
             if event.char not in "0123456789":
+                return "break"
+            if len(cell_text) >= 3:
                 return "break"
 
             new_text = cell_text + event.char
@@ -416,10 +451,11 @@ class SequenceTextEditor(tk.Frame):
                 start_idx = "{}-{}c".format(tk.INSERT, len(cell_text))
                 self.seq_text.delete(start_idx, tk.INSERT)
                 self.seq_text.insert(tk.INSERT, "255" + CELL_SEP)
-            elif len(new_text) == 3:
-                self.seq_text.insert(tk.INSERT, event.char + CELL_SEP)
             else:
                 self.seq_text.insert(tk.INSERT, event.char)
+                if len(self._current_cell_text()) >= 3:
+                    self.seq_text.insert(tk.INSERT, CELL_SEP)
+
             return "break"
 
         return None

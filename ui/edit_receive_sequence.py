@@ -28,7 +28,7 @@ class EditReceiveSequence(tk.Toplevel):
         parent,
         row_index=0,
         index="1",
-        name="Pong received",
+        name="",
         sequence="50 6F 6E 67",
         row_count=1,
         checksum=None,
@@ -461,5 +461,5 @@ class EditReceiveSequence(tk.Toplevel):
 if __name__ == "__main__":
     root = tk.Tk()
     root.withdraw()
-    EditReceiveSequence(root, row_index=0, index="1", name="ACK", sequence="<ACK>")
+    EditReceiveSequence(root, row_index=0, index="1", name="", sequence="")
     root.mainloop()
