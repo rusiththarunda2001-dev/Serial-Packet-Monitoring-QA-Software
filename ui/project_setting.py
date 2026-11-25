@@ -1,9 +1,13 @@
 """Project Settings dialog UI."""
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
-from core.comm_service import list_available_ports
+from core.comm_service import (
+    COMM_MODE_MONITORING,
+    COMM_MODE_SEND_RECEIVE,
+    list_available_ports,
+)
 
 
 class ProjectSetting(tk.Toplevel):
@@ -11,7 +15,7 @@ class ProjectSetting(tk.Toplevel):
         super().__init__(parent)
         self.home = parent
         self.title("Project Settings")
-        self.geometry("540x520")
+        self.geometry("540x600")
         self.resizable(False, False)
         self.configure(bg="#f0f0f0")
         self.transient(parent)
@@ -22,9 +26,11 @@ class ProjectSetting(tk.Toplevel):
         self._tab_underlines = {}
         self._tab_frames = {}
         self._com_port_combos = {}
+        self._flow_control_radios = []
 
         self._build_layout()
         self._load_settings(self.home.project_settings.as_dict())
+        self._on_comm_mode_changed()
 
     def _build_layout(self):
         footer = tk.Frame(self, bg="#f0f0f0", padx=16)
@@ -115,29 +121,62 @@ class ProjectSetting(tk.Toplevel):
             font=("Segoe UI", 9, "bold"),
         ).pack(anchor=tk.W, pady=(0, 4))
 
-        self.comm_mode = tk.StringVar(value="send_receive")
+        self.comm_mode = tk.StringVar(value=COMM_MODE_SEND_RECEIVE)
         ttk.Radiobutton(
             section,
             text="Send/Receive",
             variable=self.comm_mode,
-            value="send_receive",
+            value=COMM_MODE_SEND_RECEIVE,
+            command=self._on_comm_mode_changed,
+        ).pack(anchor=tk.W)
+        ttk.Radiobutton(
+            section,
+            text="Monitoring (receive only)",
+            variable=self.comm_mode,
+            value=COMM_MODE_MONITORING,
+            command=self._on_comm_mode_changed,
         ).pack(anchor=tk.W)
 
     def _build_channel_selection(self, parent):
         section = tk.Frame(parent, bg="#f0f0f0")
         section.pack(fill=tk.X, pady=(0, 4))
 
-        tk.Label(
+        self._channel_title = tk.Label(
             section,
             text="Send/Receive on Comm. Channel",
             bg="#f0f0f0",
             font=("Segoe UI", 9, "bold"),
-        ).pack(anchor=tk.W, pady=(0, 4))
+        )
+        self._channel_title.pack(anchor=tk.W, pady=(0, 4))
 
-        self.channel_combo = ttk.Combobox(section, values=[], state="readonly")
-        self.channel_combo.pack(fill=tk.X, pady=(0, 4))
+        ports_frame = tk.Frame(section, bg="#f0f0f0")
+        ports_frame.pack(fill=tk.X, pady=(0, 4))
+        ports_frame.columnconfigure(1, weight=1)
 
-        tk.Label(
+        self._channel1_label = tk.Label(
+            ports_frame,
+            text="Channel 1",
+            bg="#f0f0f0",
+            font=("Segoe UI", 9),
+            width=10,
+            anchor=tk.W,
+        )
+        self.channel_combo = ttk.Combobox(ports_frame, values=[], state="readonly")
+        self.channel_combo.grid(row=0, column=1, sticky=tk.EW)
+        self.channel_combo.bind("<<ComboboxSelected>>", self._update_alias_originals)
+
+        self._channel2_label = tk.Label(
+            ports_frame,
+            text="Channel 2",
+            bg="#f0f0f0",
+            font=("Segoe UI", 9),
+            width=10,
+            anchor=tk.W,
+        )
+        self.channel2_combo = ttk.Combobox(ports_frame, values=[], state="readonly")
+        self.channel2_combo.bind("<<ComboboxSelected>>", self._update_alias_originals)
+
+        self._channel_hint = tk.Label(
             section,
             text="Choose a COM port from the list of currently available devices.",
             bg="#f0f0f0",
@@ -145,7 +184,57 @@ class ProjectSetting(tk.Toplevel):
             font=("Segoe UI", 8),
             justify=tk.LEFT,
             wraplength=500,
-        ).pack(anchor=tk.W)
+        )
+        self._channel_hint.pack(anchor=tk.W)
+
+    def _on_comm_mode_changed(self):
+        monitoring = self.comm_mode.get() == COMM_MODE_MONITORING
+        if monitoring:
+            self._channel_title.config(text="Monitoring: Receive on Comm. Channels")
+            self._channel1_label.grid(row=0, column=0, sticky=tk.W)
+            self._channel2_label.grid(row=1, column=0, sticky=tk.W, pady=(4, 0))
+            self.channel2_combo.grid(row=1, column=1, sticky=tk.EW, pady=(4, 0))
+            self._channel_hint.config(
+                text=(
+                    "Channel 1 receives the data sent by device 1, channel 2 the "
+                    "data sent by device 2 (e.g. using a monitoring cable). Both "
+                    "ports use the COM port settings below. Nothing is sent in "
+                    "this mode."
+                )
+            )
+        else:
+            self._channel_title.config(text="Send/Receive on Comm. Channel")
+            self._channel1_label.grid_remove()
+            self._channel2_label.grid_remove()
+            self.channel2_combo.grid_remove()
+            self._channel_hint.config(
+                text="Choose a COM port from the list of currently available devices."
+            )
+
+        state = tk.DISABLED if monitoring else tk.NORMAL
+        for radio in self._flow_control_radios:
+            radio.config(state=state)
+        if monitoring:
+            self._flow_monitoring_note.pack(
+                anchor=tk.W, pady=(0, 8), before=self._flow_section
+            )
+        else:
+            self._flow_monitoring_note.pack_forget()
+        self._update_alias_originals()
+
+    def _update_alias_originals(self, _event=None):
+        if self.comm_mode.get() == COMM_MODE_MONITORING:
+            names = (
+                self.channel_combo.get().strip() or "Channel 1",
+                self.channel2_combo.get().strip() or "Channel 2",
+            )
+        else:
+            names = ("TX", "RX")
+        for entry, name in zip(self.channel_alias_originals, names):
+            entry.config(state=tk.NORMAL)
+            entry.delete(0, tk.END)
+            entry.insert(0, name)
+            entry.config(state="readonly")
 
     def _build_com_port_settings(self, parent):
         section = tk.Frame(parent, bg="#f0f0f0")
@@ -192,23 +281,41 @@ class ProjectSetting(tk.Toplevel):
             self._com_port_combos[key] = combo
 
     def _build_flow_control_tab(self, parent):
+        self._flow_monitoring_note = tk.Label(
+            parent,
+            text=(
+                "Flow control applies to Send/Receive mode only. In Monitoring mode "
+                "the ports only listen and never hold off the monitored devices."
+            ),
+            bg="#f0f0f0",
+            fg="#555555",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+            wraplength=500,
+        )
+
         section = ttk.LabelFrame(parent, text="Flow Control Support", padding=10)
         section.pack(fill=tk.X, pady=(4, 12))
+        self._flow_section = section
 
         self.flow_control = tk.StringVar(value="off")
 
-        ttk.Radiobutton(section, text="Off", variable=self.flow_control, value="off").pack(
-            anchor=tk.W, pady=(0, 6)
+        radio = ttk.Radiobutton(
+            section, text="Off", variable=self.flow_control, value="off"
         )
+        radio.pack(anchor=tk.W, pady=(0, 6))
+        self._flow_control_radios.append(radio)
 
         manual_row = tk.Frame(section)
         manual_row.pack(fill=tk.X, anchor=tk.W, pady=(0, 6))
-        ttk.Radiobutton(
+        radio = ttk.Radiobutton(
             manual_row,
             text="Manual:",
             variable=self.flow_control,
             value="manual",
-        ).pack(side=tk.LEFT, anchor=tk.N)
+        )
+        radio.pack(side=tk.LEFT, anchor=tk.N)
+        self._flow_control_radios.append(radio)
         tk.Label(
             manual_row,
             text=(
@@ -219,26 +326,32 @@ class ProjectSetting(tk.Toplevel):
             wraplength=420,
         ).pack(side=tk.LEFT, padx=(4, 0))
 
-        ttk.Radiobutton(
+        radio = ttk.Radiobutton(
             section,
             text="Hardware Handshaking - RTS/CTS",
             variable=self.flow_control,
             value="hardware",
-        ).pack(anchor=tk.W, pady=(0, 6))
+        )
+        radio.pack(anchor=tk.W, pady=(0, 6))
+        self._flow_control_radios.append(radio)
 
-        ttk.Radiobutton(
+        radio = ttk.Radiobutton(
             section,
             text="Software Handshaking - XON/XOFF",
             variable=self.flow_control,
             value="software",
-        ).pack(anchor=tk.W, pady=(0, 6))
+        )
+        radio.pack(anchor=tk.W, pady=(0, 6))
+        self._flow_control_radios.append(radio)
 
-        ttk.Radiobutton(
+        radio = ttk.Radiobutton(
             section,
             text="RS485 Transceiver Control - Set RTS high while sending",
             variable=self.flow_control,
             value="rs485",
-        ).pack(anchor=tk.W)
+        )
+        radio.pack(anchor=tk.W)
+        self._flow_control_radios.append(radio)
 
         warning = tk.Frame(parent, bg="#f0f0f0")
         warning.pack(fill=tk.X)
@@ -334,6 +447,7 @@ class ProjectSetting(tk.Toplevel):
 
         channels = (("Channel 1", "TX"), ("Channel 2", "RX"))
         self.channel_alias_entries = []
+        self.channel_alias_originals = []
 
         for row_index, (channel_label, default_name) in enumerate(channels, start=1):
             row = tk.Frame(alias_section, bg="#f0f0f0")
@@ -354,28 +468,40 @@ class ProjectSetting(tk.Toplevel):
             original_entry.insert(0, default_name)
             original_entry.config(state="readonly")
             original_entry.grid(row=0, column=1, sticky=tk.EW, padx=(0, 8))
+            self.channel_alias_originals.append(original_entry)
 
             alias_entry = ttk.Entry(row)
             alias_entry.grid(row=0, column=2, sticky=tk.EW)
             self.channel_alias_entries.append(alias_entry)
 
-    def _refresh_channel_ports(self, selected_channel=None):
-        channel = (selected_channel or self.channel_combo.get() or "COM1").strip()
-        ports = list_available_ports(include=channel)
-        self.channel_combo["values"] = ports
+    @staticmethod
+    def _fill_port_combo(combo, channel, ports):
+        combo["values"] = ports
         if ports:
-            self.channel_combo.config(state="readonly")
-            if channel in ports:
-                self.channel_combo.set(channel)
-            else:
-                self.channel_combo.set(ports[0])
+            combo.config(state="readonly")
+            combo.set(channel if channel in ports else ports[0])
         else:
-            self.channel_combo.config(state="normal")
-            self.channel_combo.set(channel)
+            combo.config(state="normal")
+            combo.set(channel)
+
+    def _refresh_channel_ports(self, selected_channel=None, selected_channel2=None):
+        channel = (selected_channel or self.channel_combo.get() or "COM1").strip()
+        channel2 = (selected_channel2 or self.channel2_combo.get() or "COM2").strip()
+        self._fill_port_combo(
+            self.channel_combo, channel, list_available_ports(include=channel)
+        )
+        self._fill_port_combo(
+            self.channel2_combo, channel2, list_available_ports(include=channel2)
+        )
 
     def _load_settings(self, settings):
-        self.comm_mode.set(settings.get("comm_mode", "send_receive"))
-        self._refresh_channel_ports(settings.get("channel", "COM1"))
+        mode = settings.get("comm_mode", COMM_MODE_SEND_RECEIVE)
+        if mode not in (COMM_MODE_SEND_RECEIVE, COMM_MODE_MONITORING):
+            mode = COMM_MODE_SEND_RECEIVE
+        self.comm_mode.set(mode)
+        self._refresh_channel_ports(
+            settings.get("channel", "COM1"), settings.get("channel2", "COM2")
+        )
 
         for key, combo in self._com_port_combos.items():
             combo.set(settings.get(key, combo.get()))
@@ -393,6 +519,7 @@ class ProjectSetting(tk.Toplevel):
         return {
             "comm_mode": self.comm_mode.get(),
             "channel": self.channel_combo.get().strip(),
+            "channel2": self.channel2_combo.get().strip(),
             "baud_rate": self._com_port_combos["baud_rate"].get(),
             "data_bits": self._com_port_combos["data_bits"].get(),
             "parity": self._com_port_combos["parity"].get(),
@@ -406,7 +533,24 @@ class ProjectSetting(tk.Toplevel):
         }
 
     def _on_ok(self):
-        self.home.apply_project_settings(self._collect_settings())
+        settings = self._collect_settings()
+        if settings["comm_mode"] == COMM_MODE_MONITORING:
+            if not settings["channel2"]:
+                messagebox.showwarning(
+                    "Project Settings",
+                    "Choose a COM port for channel 2.",
+                    parent=self,
+                )
+                return
+            if settings["channel"].lower() == settings["channel2"].lower():
+                messagebox.showwarning(
+                    "Project Settings",
+                    "Monitoring needs two different COM ports for channel 1 "
+                    "and channel 2.",
+                    parent=self,
+                )
+                return
+        self.home.apply_project_settings(settings)
         self.destroy()
 
     def _on_cancel(self):
@@ -422,7 +566,6 @@ class ProjectSetting(tk.Toplevel):
         ttk.Button(btn_group, text="Cancel", width=10, command=self._on_cancel).pack(
             side=tk.LEFT, padx=(0, 6)
         )
-        ttk.Button(btn_group, text="Help", width=10).pack(side=tk.LEFT)
 
 
 if __name__ == "__main__":

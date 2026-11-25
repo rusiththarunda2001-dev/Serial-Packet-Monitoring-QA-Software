@@ -1,12 +1,12 @@
 """Edit Send Sequence dialog UI."""
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
-from core.checksum import build_checksum_preview_text
+from core.checksum import build_checksum_preview_text, check_checksum_rule
 from core.checksum_rules import CHECKSUM_OPTIONS, DEFAULT_CHECKSUM
-from core.sequence_codec import SequenceEncodeError, encode_sequence
-from ui.sequence_text_editor import SequenceTextEditor
+from core.sequence_codec import SequenceEncodeError, encode_sequence, has_wildcards
+from ui.sequence_text_editor import SequenceTextEditor, check_sequence_fields
 
 
 class EditSendRequest(tk.Toplevel):
@@ -22,14 +22,18 @@ class EditSendRequest(tk.Toplevel):
         repeat_interval=0.0,
         checksum=None,
         display_mode="HEX",
+        on_discard=None,
     ):
         super().__init__(parent)
         self.home = parent
         self._row_index = row_index
+        # Set for a row that was just added: Cancel removes it again unless saved.
+        self._on_discard = on_discard
+        self._saved = False
         self._row_count = max(1, row_count)
 
         self.title("Edit Send Sequence")
-        self.geometry("720x540")
+        self.geometry("720x570")
         self.resizable(False, False)
         self.configure(bg="#d9d9d9")
         self.transient(parent)
@@ -146,6 +150,9 @@ class EditSendRequest(tk.Toplevel):
             self.checksum_combo.get(),
             self.sequence_editor.get_display_mode(),
         )
+        if description_text and has_wildcards(self.sequence_editor.get_sequence_string()):
+            preview_text = ("Preview: the checksum is calculated when the sequence is sent, "
+                            "after the ? bytes are filled in.")
         self.checksum_preview_label.config(text=preview_text)
         self.checksum_description_label.config(text=description_text)
 
@@ -182,18 +189,17 @@ class EditSendRequest(tk.Toplevel):
         self.repeat_seconds_entry.pack(side=tk.LEFT, padx=4)
         tk.Label(repeat_row, text="seconds", bg="#d9d9d9").pack(side=tk.LEFT)
 
+        # Editable: pick a checksum from the list or type one, e.g. a custom
+        # "CRC:16,8005,FFFF,0000,Yes,Yes", optionally with " L" for low byte first.
         self.checksum_combo = ttk.Combobox(
             checksum_tab,
             values=CHECKSUM_OPTIONS,
             width=72,
-            state="readonly",
         )
-        if self._checksum in CHECKSUM_OPTIONS:
-            self.checksum_combo.set(self._checksum)
-        else:
-            self.checksum_combo.set(DEFAULT_CHECKSUM)
+        self.checksum_combo.set(self._checksum or DEFAULT_CHECKSUM)
         self.checksum_combo.pack(fill=tk.X, anchor=tk.W, pady=(0, 6))
         self.checksum_combo.bind("<<ComboboxSelected>>", self._update_checksum_preview)
+        self.checksum_combo.bind("<KeyRelease>", self._update_checksum_preview)
 
         preview_area = tk.Frame(checksum_tab, bg="#e6e6e6", relief=tk.SUNKEN, bd=1, height=72)
         preview_area.pack(fill=tk.X)
@@ -250,14 +256,39 @@ class EditSendRequest(tk.Toplevel):
         btn_group = tk.Frame(footer, bg="#d9d9d9")
         btn_group.pack(side=tk.RIGHT)
         ttk.Button(btn_group, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_group, text="Cancel", command=self.destroy).pack(
+        ttk.Button(btn_group, text="Cancel", command=self.on_close).pack(
             side=tk.LEFT, padx=2
         )
         ttk.Button(btn_group, text="Apply", command=self._on_apply).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_group, text="Help").pack(side=tk.LEFT, padx=2)
+
+    def _repeat_interval_problem(self):
+        value = self.repeat_seconds_entry.get().strip()
+        if not value:
+            return None
+        try:
+            number = float(value)
+        except ValueError:
+            return 'The repeat time "{}" is not a number of seconds (e.g. 0.5 or 2).'.format(value)
+        if number < 0:
+            return "The repeat time cannot be negative."
+        return None
 
     def _save_sequence(self):
         name = self.name_entry.get().strip()
+        problem = check_sequence_fields(
+            name, self.sequence_editor, self.home._send_rows, self._row_index, "send")
+        if problem:
+            messagebox.showerror("Send Sequence", problem, parent=self)
+            return False
+        problem = self._repeat_interval_problem()
+        if problem:
+            messagebox.showerror("Repeat", problem, parent=self)
+            return False
+        problem = check_checksum_rule(self.checksum_combo.get())
+        if problem:
+            messagebox.showerror("Checksum", "The checksum is not valid:\n\n{}".format(problem),
+                                 parent=self)
+            return False
         sequence = self.sequence_editor.get_sequence_string()
         new_index = self._get_index() - 1
         self.home.update_send_sequence(
@@ -271,15 +302,31 @@ class EditSendRequest(tk.Toplevel):
             display_mode=self.sequence_editor.get_display_mode(),
         )
         self._row_index = new_index
+        self._saved = True
+        return True
 
     def _on_ok(self):
-        self._save_sequence()
-        self.destroy()
+        if self._save_sequence():
+            self.destroy()
 
     def _on_apply(self):
         self._save_sequence()
 
+    def on_close(self):
+        """Cancel / window X: a just-added sequence that was never saved is removed."""
+        if self._on_discard is not None and not self._saved:
+            self._on_discard(self._row_index)
+        self.destroy()
+
     def _on_delete(self):
+        name = self.name_entry.get().strip() or "this sequence"
+        message = 'Delete the send sequence "{}"?'.format(name)
+        answering = self.home.receive_sequences_answering_with(self._row_index)
+        if answering:
+            message += ("\n\nThese receive sequences send it as their automatic answer and "
+                        'will be set to "No answer": {}'.format(", ".join(answering)))
+        if not messagebox.askyesno("Delete Sequence", message, parent=self):
+            return
         self.home.delete_send_sequence(self._row_index)
         self.destroy()
 

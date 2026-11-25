@@ -4,19 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-ACTION_TYPES = ("Answer", "Comment", "Trigger", "Stop")
+ACTION_TYPES = ("Answer", "Comment", "Stop")
 NO_ANSWER_SEND_INDEX = -1
 NO_ANSWER_OPTION = "No answer"
 
 
 @dataclass
 class ReceiveActionConfig:
-    action_type: str = "Answer"
-    answer_send_index: int = 0
+    # New receive sequences only add a comment: an automatic answer must be chosen
+    # on purpose, otherwise it sends unexpected data (e.g. onto an RS485 bus).
+    action_type: str = "Comment"
+    answer_send_index: int = NO_ANSWER_SEND_INDEX
     comment_text: str = ""
     comment_line_break: bool = True
     comment_timestamp: bool = False
-    snapshot_trigger: bool = True
     stop_communication: bool = False
 
 
@@ -48,8 +49,7 @@ def parse_receive_action(row, sequence_name: str = "") -> ReceiveActionConfig:
     comment_text = row[8] if len(row) > 8 else default_comment_text(name)
     comment_line_break = row[9] if len(row) > 9 else True
     comment_timestamp = row[10] if len(row) > 10 else False
-    snapshot_trigger = row[11] if len(row) > 11 else True
-    stop_communication = row[12] if len(row) > 12 else False
+    stop_communication = row[11] if len(row) > 11 else False
 
     return ReceiveActionConfig(
         action_type=action_type,
@@ -57,7 +57,6 @@ def parse_receive_action(row, sequence_name: str = "") -> ReceiveActionConfig:
         comment_text=comment_text,
         comment_line_break=bool(comment_line_break),
         comment_timestamp=bool(comment_timestamp),
-        snapshot_trigger=bool(snapshot_trigger),
         stop_communication=bool(stop_communication),
     )
 
@@ -86,6 +85,5 @@ def receive_action_fields(action: ReceiveActionConfig) -> tuple:
         action.comment_text,
         action.comment_line_break,
         action.comment_timestamp,
-        action.snapshot_trigger,
         action.stop_communication,
     )

@@ -61,7 +61,6 @@ def _serialize_receive_row(row) -> dict:
             "comment_text": action.comment_text,
             "comment_line_break": action.comment_line_break,
             "comment_timestamp": action.comment_timestamp,
-            "snapshot_trigger": action.snapshot_trigger,
             "stop_communication": action.stop_communication,
         },
     }
@@ -106,7 +105,6 @@ def _deserialize_receive_row(data: dict) -> tuple:
         comment_text=str(action_data.get("comment_text", "")),
         comment_line_break=bool(action_data.get("comment_line_break", True)),
         comment_timestamp=bool(action_data.get("comment_timestamp", False)),
-        snapshot_trigger=bool(action_data.get("snapshot_trigger", True)),
         stop_communication=bool(action_data.get("stop_communication", False)),
     )
     return (
@@ -173,7 +171,7 @@ def apply_project_document(home, document: dict) -> None:
 
     home.stop_repeat_senders()
     home.project_settings.update(settings)
-    home.com_port.set(home.project_settings.get("channel"))
+    home.com_port.set(home.get_port_summary())
 
     home._send_rows = [_deserialize_send_row(row) for row in send_rows]
     home._receive_rows = [_deserialize_receive_row(row) for row in receive_rows]
@@ -262,7 +260,7 @@ def save_project_file(path, home) -> None:
     receive_headers = [
         "active", "name", "sequence", "checksum", "checksum_detect", "display_mode",
         "action_type", "answer_send_index", "comment_text", "comment_line_break",
-        "comment_timestamp", "snapshot_trigger", "stop_communication"
+        "comment_timestamp", "stop_communication"
     ]
     ws_receive.append(receive_headers)
     
@@ -280,7 +278,6 @@ def save_project_file(path, home) -> None:
             str(action.get("comment_text", "")),
             str(action.get("comment_line_break", True)),
             str(action.get("comment_timestamp", False)),
-            str(action.get("snapshot_trigger", True)),
             str(action.get("stop_communication", False))
         ])
 
@@ -405,7 +402,7 @@ def load_project_file(path) -> dict:
             action_keys = {
                 "action_type", "answer_send_index", "comment_text", 
                 "comment_line_break", "comment_timestamp", 
-                "snapshot_trigger", "stop_communication"
+                "stop_communication"
             }
 
             for row in ws_receive.iter_rows(min_row=2, values_only=True):
@@ -416,7 +413,7 @@ def load_project_file(path) -> dict:
                     if i < len(row):
                         val = row[i] if row[i] is not None else ""
                         
-                        if header in ("active", "comment_line_break", "comment_timestamp", "snapshot_trigger", "stop_communication"):
+                        if header in ("active", "comment_line_break", "comment_timestamp", "stop_communication"):
                             val = str(val).lower() in ("true", "1")
                         elif header == "answer_send_index":
                             try: val = int(val)

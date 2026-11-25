@@ -1,9 +1,9 @@
 """Edit Receive Sequence dialog UI."""
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 
-from core.checksum import build_checksum_preview_text
+from core.checksum import build_checksum_preview_text, check_checksum_rule
 from core.checksum_rules import (
     CHECKSUM_DETECT_OPTIONS,
     CHECKSUM_OPTIONS,
@@ -17,8 +17,8 @@ from core.receive_actions import (
     ReceiveActionConfig,
     default_comment_text,
 )
-from core.sequence_codec import SequenceEncodeError, encode_sequence
-from ui.sequence_text_editor import SequenceTextEditor
+from core.sequence_codec import SequenceEncodeError, encode_sequence, has_wildcards
+from ui.sequence_text_editor import SequenceTextEditor, check_sequence_fields
 ACTION_TAB_INDEX = {name: index for index, name in enumerate(ACTION_TYPES)}
 
 
@@ -35,14 +35,18 @@ class EditReceiveSequence(tk.Toplevel):
         checksum_detect=None,
         display_mode="HEX",
         action=None,
+        on_discard=None,
     ):
         super().__init__(parent)
         self.home = parent
         self._row_index = row_index
+        # Set for a row that was just added: Cancel removes it again unless saved.
+        self._on_discard = on_discard
+        self._saved = False
         self._row_count = max(1, row_count)
 
         self.title("Edit Receive Sequence")
-        self.geometry("720x540")
+        self.geometry("720x570")
         self.resizable(False, False)
         self.configure(bg="#d9d9d9")
         self.transient(parent)
@@ -168,6 +172,9 @@ class EditReceiveSequence(tk.Toplevel):
             self.checksum_combo.get(),
             self.sequence_editor.get_display_mode(),
         )
+        if description_text and has_wildcards(self.sequence_editor.get_sequence_string()):
+            preview_text = ("Preview: the ? bytes match any value; the checksum is checked "
+                            "over the bytes really received.")
         self.checksum_preview_label.config(text=preview_text)
         self.checksum_description_label.config(text=description_text)
 
@@ -181,19 +188,16 @@ class EditReceiveSequence(tk.Toplevel):
 
         answer_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
         comment_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
-        trigger_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
         stop_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
         checksum_tab = tk.Frame(notebook, bg="#d9d9d9", padx=8, pady=8)
 
         notebook.add(answer_tab, text="Answer")
         notebook.add(comment_tab, text="Comment")
-        notebook.add(trigger_tab, text="Trigger")
         notebook.add(stop_tab, text="Stop")
         notebook.add(checksum_tab, text="Checksum")
 
         self._build_answer_tab(answer_tab)
         self._build_comment_tab(comment_tab)
-        self._build_trigger_tab(trigger_tab)
         self._build_stop_tab(stop_tab)
         self._build_checksum_tab(checksum_tab)
 
@@ -219,14 +223,21 @@ class EditReceiveSequence(tk.Toplevel):
         except ValueError:
             return NO_ANSWER_SEND_INDEX
 
+    def _comment_for_save(self):
+        """The comment text; the automatic one ('"Name" received') follows a rename."""
+        comment = self.comment_entry.get()
+        new_name = self.name_entry.get().strip()
+        if comment.strip() == default_comment_text(self._name) and new_name != self._name:
+            comment = default_comment_text(new_name)
+        return comment
+
     def _get_action_config(self):
         return ReceiveActionConfig(
             action_type=self._current_action_type,
             answer_send_index=self._parse_answer_send_index(),
-            comment_text=self.comment_entry.get(),
+            comment_text=self._comment_for_save(),
             comment_line_break=self.comment_line_break_var.get(),
             comment_timestamp=self.comment_timestamp_var.get(),
-            snapshot_trigger=self.snapshot_trigger_var.get(),
             stop_communication=self.stop_communication_var.get(),
         )
 
@@ -243,9 +254,8 @@ class EditReceiveSequence(tk.Toplevel):
                 option_index = action.answer_send_index + 1
                 if option_index < len(send_options):
                     self.answer_combo.set(send_options[option_index])
-                elif len(send_options) > 1:
-                    self.answer_combo.set(send_options[1])
                 else:
+                    # The answer sequence no longer exists: never pick another one.
                     self.answer_combo.set(NO_ANSWER_OPTION)
 
         self.comment_entry.delete(0, tk.END)
@@ -255,7 +265,6 @@ class EditReceiveSequence(tk.Toplevel):
         )
         self.comment_line_break_var.set(action.comment_line_break)
         self.comment_timestamp_var.set(action.comment_timestamp)
-        self.snapshot_trigger_var.set(action.snapshot_trigger)
         self.stop_communication_var.set(action.stop_communication)
 
     def _build_answer_tab(self, parent):
@@ -321,33 +330,7 @@ class EditReceiveSequence(tk.Toplevel):
             variable=self.comment_timestamp_var,
         ).pack(anchor=tk.W)
 
-    def _build_trigger_tab(self, parent):
-        tk.Label(
-            parent,
-            text="Docklight Snapshot Mode",
-            bg="#d9d9d9",
-            font=("Segoe UI", 9, "bold"),
-            anchor=tk.W,
-        ).pack(fill=tk.X, pady=(0, 8))
-
-        trigger_row = tk.Frame(parent, bg="#d9d9d9")
-        trigger_row.pack(fill=tk.X, anchor=tk.W)
-
-        self.snapshot_trigger_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(trigger_row, variable=self.snapshot_trigger_var).pack(
-            side=tk.LEFT, anchor=tk.N, padx=(0, 6)
-        )
-        tk.Label(
-            trigger_row,
-            text=(
-                "Use this sequence as a trigger for the snapshot: If the sequence "
-                "appears in the communication data received, Docklight will create "
-                "a snapshot of this data in the communication window."
-            ),
-            bg="#d9d9d9",
-            justify=tk.LEFT,
-            wraplength=600,
-        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+    
 
     def _build_stop_tab(self, parent):
         self.stop_communication_var = tk.BooleanVar(value=False)
@@ -364,18 +347,16 @@ class EditReceiveSequence(tk.Toplevel):
         dropdown_row = tk.Frame(parent, bg="#d9d9d9")
         dropdown_row.pack(fill=tk.X, pady=(0, 6))
 
+        # Editable: pick a checksum from the list or type one (see core/checksum.py).
         self.checksum_combo = ttk.Combobox(
             dropdown_row,
             values=CHECKSUM_OPTIONS,
             width=55,
-            state="readonly",
         )
-        if self._checksum in CHECKSUM_OPTIONS:
-            self.checksum_combo.set(self._checksum)
-        else:
-            self.checksum_combo.set(DEFAULT_CHECKSUM)
+        self.checksum_combo.set(self._checksum or DEFAULT_CHECKSUM)
         self.checksum_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.checksum_combo.bind("<<ComboboxSelected>>", self._update_checksum_preview)
+        self.checksum_combo.bind("<KeyRelease>", self._update_checksum_preview)
 
         self.detect_combo = ttk.Combobox(
             dropdown_row,
@@ -423,16 +404,26 @@ class EditReceiveSequence(tk.Toplevel):
         btn_group = tk.Frame(footer, bg="#d9d9d9")
         btn_group.pack(side=tk.RIGHT)
         ttk.Button(btn_group, text="OK", command=self._on_ok).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_group, text="Cancel", command=self.destroy).pack(
+        ttk.Button(btn_group, text="Cancel", command=self.on_close).pack(
             side=tk.LEFT, padx=2
         )
         ttk.Button(btn_group, text="Apply", command=self._on_apply).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_group, text="Help").pack(side=tk.LEFT, padx=2)
 
     def _save_sequence(self):
         name = self.name_entry.get().strip()
+        problem = check_sequence_fields(
+            name, self.sequence_editor, self.home._receive_rows, self._row_index, "receive")
+        if problem:
+            messagebox.showerror("Receive Sequence", problem, parent=self)
+            return False
+        problem = check_checksum_rule(self.checksum_combo.get())
+        if problem:
+            messagebox.showerror("Checksum", "The checksum is not valid:\n\n{}".format(problem),
+                                 parent=self)
+            return False
         sequence = self.sequence_editor.get_sequence_string()
         new_index = self._get_index() - 1
+        action = self._get_action_config()
         self.home.update_receive_sequence(
             self._row_index,
             new_index,
@@ -441,19 +432,34 @@ class EditReceiveSequence(tk.Toplevel):
             checksum=self.checksum_combo.get(),
             checksum_detect=self.detect_combo.get(),
             display_mode=self.sequence_editor.get_display_mode(),
-            action=self._get_action_config(),
+            action=action,
         )
-        self._action = self._get_action_config()
+        self._action = action
+        self._name = name
+        self.comment_entry.delete(0, tk.END)
+        self.comment_entry.insert(0, action.comment_text)
         self._row_index = new_index
+        self._saved = True
+        return True
 
     def _on_ok(self):
-        self._save_sequence()
-        self.destroy()
+        if self._save_sequence():
+            self.destroy()
 
     def _on_apply(self):
         self._save_sequence()
 
+    def on_close(self):
+        """Cancel / window X: a just-added sequence that was never saved is removed."""
+        if self._on_discard is not None and not self._saved:
+            self._on_discard(self._row_index)
+        self.destroy()
+
     def _on_delete(self):
+        name = self.name_entry.get().strip() or "this sequence"
+        if not messagebox.askyesno(
+                "Delete Sequence", 'Delete the receive sequence "{}"?'.format(name), parent=self):
+            return
         self.home.delete_receive_sequence(self._row_index)
         self.destroy()
 
