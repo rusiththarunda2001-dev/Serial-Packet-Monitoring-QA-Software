@@ -1,9 +1,14 @@
 """Docklight home page UI."""
 
 from datetime import datetime
+from pathlib import Path
+import threading
+import time
+import tksheet
+import queue  
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from core.checksum import ChecksumError, append_checksum
 from core.comm_display import (
@@ -11,45 +16,86 @@ from core.comm_display import (
     format_line_ending_segments,
     iter_comm_lines,
 )
-from core.comm_service import CommService, ErrorEvent, RxEvent, TxEvent
+from core.comm_service import (
+    COMM_MODE_MONITORING,
+    CommService,
+    ErrorEvent,
+    RxEvent,
+    TxEvent,
+)
 from core.checksum_rules import DEFAULT_CHECKSUM
 from core.receive_actions import (
+    NO_ANSWER_SEND_INDEX,
     ReceiveActionConfig,
     default_comment_text,
+    format_answer_display,
     parse_receive_action,
     receive_action_fields,
+)
+from core.project_file import (
+    ProjectFileError,
+    apply_project_document,
+    load_project_file,
+    save_project_file,
 )
 from core.receive_matcher import find_matches
 from core.sequence_codec import (
     PLACEHOLDER_PATTERN,
+    WILDCARD,
     SequenceEncodeError,
+    count_wildcards,
     encode_sequence,
+    fill_wildcards,
     format_sequence_display,
+    parse_parameter_values,
 )
-from project_settings import ProjectSettings
+from core.settings_saver import ProjectSettings
 from route.routes import Routes
 from ui.edit_receive_sequence import DEFAULT_CHECKSUM_DETECT
+from ui.chatbot_window import ChatbotPanel
+
+
+# As in Docklight, the line-status panel is shown only in Manual mode.
+_FLOW_CONTROL_BAR_LABELS = {
+    "manual": "Manual RTS/DTR Control",
+}
 
 
 class HomePage(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("EC Docklight V2.3")
-        self.geometry("1100x650")
-        self.minsize(900, 550)
+        self.geometry("1100x750")
+        self.minsize(900, 650)
         self.configure(bg="#d9d9d9")
 
         self._send_rows = []
         self._receive_rows = []
+        self._receive_wait_condition = threading.Condition()
+        self._receive_sequence_waiters = []
+        self._receive_match_totals = {}  # receive row index -> matches seen so far
+        self._last_send_parameters = {}  # send sequence name -> last ? values typed
+        self._active_script = None
+        self._comm_log = None  # set while StartLogging is active
         self._send_buttons = {}
         self._repeat_after_ids = {}
         self._global_display_mode = "HEX"
         self._updating_display_mode = False
+        self._project_path = None
+        self._project_dirty = False
         self.project_settings = ProjectSettings()
         self._communication_open = False
+        self._keyboard_console_enabled = False
+        self._keyboard_console_canvas = None
+        self._toolbar_images = []
         self._comm_texts = {}
-        self.comm_service = CommService(self._on_comm_event)
+        self._handshake_poll_id = None
+        self._handshake_indicators = {}
+        self._evt_q = queue.Queue()
+        self._pump_id = None
+        self.comm_service = CommService(self._evt_q.put)
         self.routes = Routes(self)
+        self._keyboard_buffer = ""
 
         self._build_menu()
         self._build_toolbar()
@@ -58,35 +104,238 @@ class HomePage(tk.Tk):
         self.routes.bind()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after_idle(self._refresh_send_buttons)
+        self.after_idle(self._sync_flow_control_session)
+        self._update_window_title()
+        self._pump_id = self.after(30, self._pump_events)
 
     def _build_menu(self):
         menubar = tk.Menu(self)
         self.config(menu=menubar)
 
-        for label in ("File", "Edit", "Run", "Tools", "Scripting", "Help"):
-            menu = tk.Menu(menubar, tearoff=0)
-            menu.add_command(label="{} item".format(label))
-            menubar.add_cascade(label=label, menu=menu)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="New Project...", command=self.routes.new_project)
+        file_menu.add_command(label="Open Project...", command=self.routes.open_project)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save Project", command=self.routes.save_project)
+        file_menu.add_command(
+            label="Save Project As...", command=self.routes.save_project_as
+        )
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self._file_menu = file_menu
+
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu.add_command(
+            label="Add Send Sequence", command=self.routes.add_send_sequence
+        )
+        edit_menu.add_command(
+            label="Add Receive Sequence", command=self.routes.add_receive_sequence
+        )
+        menubar.add_cascade(label="Edit", menu=edit_menu)
+
+        run_menu = tk.Menu(menubar, tearoff=0)
+        run_menu.add_command(
+            label="Start Communication", command=self.routes.start_communication
+        )
+        run_menu.add_command(
+            label="Stop Communication", command=self.routes.stop_communication
+        )
+        run_menu.add_separator()
+        run_menu.add_command(
+            label="Keyboard Console", command=self.routes.toggle_keyboard_console
+        )
+        menubar.add_cascade(label="Run", menu=run_menu)
+
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(
+            label="Project Settings...", command=self.routes.open_project_settings
+        )
+        tools_menu.add_command(
+            label="Show/Hide Chatbot", command=self._toggle_chatbot_panel
+        )
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
+        script_menu = tk.Menu(menubar, tearoff=0)
+        script_menu.add_command(label="Run / Resume Script", command=self._on_script_play)
+        script_menu.add_command(label="Pause Script", command=self._on_script_pause)
+        script_menu.add_command(label="Stop Script", command=self._on_script_stop)
+        script_menu.add_separator()
+        script_menu.add_command(label="Edit Script", command=self.routes.edit_script)
+        menubar.add_cascade(label="Scripting", menu=script_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About EC Docklight", command=self._show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+
+    def _show_about(self):
+        messagebox.showinfo(
+            "About EC Docklight",
+            "EC Docklight\n\nSerial communication testing and automation tool.",
+            parent=self,
+        )
+
+    def get_project_path(self):
+        return self._project_path
+
+    def is_project_dirty(self):
+        return self._project_dirty
+
+    def mark_project_dirty(self):
+        if self._project_dirty:
+            return
+        self._project_dirty = True
+        self._update_window_title()
+
+    def mark_project_clean(self, path=None):
+        if path is not None:
+            self._project_path = path
+        self._project_dirty = False
+        self._update_window_title()
+
+    def _update_window_title(self):
+        base_title = "EC Docklight V2.3"
+        if self._project_path:
+            name = Path(self._project_path).name
+        else:
+            name = "Untitled"
+        dirty_marker = "*" if self._project_dirty else ""
+        self.title("{} - {}{}".format(base_title, name, dirty_marker))
+
+    def reset_project_state(self):
+        self.set_keyboard_console_enabled(False)
+        self.stop_repeat_senders()
+        self.project_settings = ProjectSettings()
+        self._send_rows = []
+        self._receive_rows = []
+        self._global_display_mode = "HEX"
+        self.com_port.set(self.get_port_summary())
+        self.comm_service.configure_session(self.project_settings.as_dict())
+        self._update_flow_control_bar()
+        self._refresh_send_tree()
+        self._refresh_receive_tree()
+        if hasattr(self, "_comm_notebook"):
+            self._comm_notebook.select(1)
+        self._clear_communication_panel()
+
+    def load_project_from_path(self, path):
+        document = load_project_file(path)
+        apply_project_document(self, document)
+        self.mark_project_clean(path=path)
+
+    def save_project_to_path(self, path):
+        save_project_file(path, self)
+        self.mark_project_clean(path=path)
+
+    def confirm_discard_unsaved_changes(self):
+        if not self._project_dirty:
+            return True
+
+        answer = messagebox.askyesnocancel(
+            "Unsaved Changes",
+            "Save changes to the current project before continuing?",
+            parent=self,
+        )
+        if answer is None:
+            return False
+        if answer:
+            return self.routes.save_project()
+        return True
 
     def _build_toolbar(self):
-        toolbar = tk.Frame(self, bg="#d4d0c8", relief=tk.RAISED, bd=1)
-        toolbar.pack(fill=tk.X)
+            toolbar = tk.Frame(self, bg="#d4d0c8", relief=tk.RAISED, bd=1)
+            toolbar.pack(fill=tk.X)
 
-        play_btn = self._toolbar_icon_button(
-            toolbar,
-            self._draw_play_icon,
-            self.routes.start_communication,
-        )
-        play_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
+            play_btn = self._toolbar_icon_button(
+                toolbar,
+                self._draw_play_icon,
+                self.routes.start_communication,
+                tooltip="Start Communication",
+            )
+            play_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
 
-        stop_btn = self._toolbar_icon_button(
-            toolbar,
-            self._draw_stop_icon,
-            self.routes.stop_communication,
-        )
-        stop_btn.pack(side=tk.LEFT, padx=(2, 6), pady=2)
+            stop_btn = self._toolbar_icon_button(
+                toolbar,
+                self._draw_stop_icon,
+                self.routes.stop_communication,
+                tooltip="Stop Communication",
+            )
+            stop_btn.pack(side=tk.LEFT, padx=(2, 0), pady=2)
 
-    def _toolbar_icon_button(self, parent, draw_icon, command):
+            # edit_btn = self._toolbar_image_button(
+            #     toolbar, "edit_script.png", self.routes.edit_script
+            # )
+            # edit_btn.pack(side=tk.LEFT, padx=(6, 0), pady=2)
+
+            keyboard_btn, keyboard_canvas = self._toolbar_icon_button(
+                toolbar,
+                self._draw_keyboard_icon,
+                self.routes.toggle_keyboard_console,
+                return_canvas=True,
+                tooltip="Keyboard Console",
+            )
+            keyboard_btn.pack(side=tk.LEFT, padx=(2, 6), pady=2)
+            self._keyboard_console_canvas = keyboard_canvas
+
+            chatbot_btn = self._toolbar_image_button(
+                toolbar,
+                "chat-bot.png",
+                self._toggle_chatbot_panel,
+                max_size=24,
+                tooltip="Show or hide Chatbot",
+            )
+            chatbot_btn.pack(side=tk.LEFT, padx=(0, 6), pady=2)
+
+    # --- NEW SCRIPTING BUTTONS ---
+            tk.Frame(toolbar, width=8, bg="#d4d0c8").pack(side=tk.LEFT)
+
+            self._btn_script_play = self._toolbar_text_button(
+                toolbar,
+                "Script Play",
+                self._on_script_play,
+                tooltip="Run or resume the script",
+            )
+            self._btn_script_play.pack(side=tk.LEFT, padx=(2, 0), pady=2)
+
+            self._btn_script_pause = self._toolbar_text_button(
+                toolbar,
+                "Script Pause",
+                self._on_script_pause,
+                tooltip="Pause the running script",
+            )
+            self._btn_script_pause.pack(side=tk.LEFT, padx=(2, 0), pady=2)
+
+            self._btn_script_stop = self._toolbar_text_button(
+                toolbar,
+                "Script Stop",
+                self._on_script_stop,
+                tooltip="Stop the script and communication",
+            )
+            self._btn_script_stop.pack(side=tk.LEFT, padx=(2, 0), pady=2)
+
+            # Initialize the button states
+            self._btn_script_play.set_state(True)
+            self._btn_script_pause.set_state(False)
+            self._btn_script_stop.set_state(False)
+
+            
+
+    def _load_toolbar_image(self, filename, max_size=None):
+            path = Path(__file__).resolve().parent / "assets" / "toolbar" / filename
+            image = tk.PhotoImage(file=str(path))
+            if max_size:
+                scale = max(
+                    1,
+                    (max(image.width(), image.height()) + max_size - 1) // max_size,
+                )
+                if scale > 1:
+                    image = image.subsample(scale, scale)
+            self._toolbar_images.append(image)
+            return image
+
+    def _toolbar_icon_button(
+        self, parent, draw_icon, command, return_canvas=False, tooltip=None
+    ):
         normal_bg = "#d4d0c8"
         hover_bg = "#b8b4ac"
 
@@ -117,8 +366,205 @@ class HomePage(tk.Tk):
             widget.bind("<Button-1>", on_click)
             widget.bind("<Enter>", on_enter)
             widget.bind("<Leave>", on_leave)
+            if tooltip:
+                self._attach_toolbar_tooltip(widget, tooltip)
 
+        if return_canvas:
+            return frame, canvas
         return frame
+
+
+    def _toolbar_text_button(self, parent, text, command, tooltip=None):
+            state = {"enabled": True}
+
+            def safe_command():
+                if state["enabled"]:
+                    command()
+
+            button = tk.Button(
+                parent,
+                text=text,
+                command=safe_command,
+                relief=tk.RAISED,
+                padx=6,
+                cursor="hand2",
+            )
+
+            def set_state(enabled):
+                state["enabled"] = enabled
+                button.configure(
+                    state=tk.NORMAL if enabled else tk.DISABLED,
+                    cursor="hand2" if enabled else "arrow",
+                )
+
+            button.set_state = set_state
+            if tooltip:
+                self._attach_toolbar_tooltip(button, tooltip)
+            return button
+
+
+    def _attach_toolbar_tooltip(self, widget, text):
+            tooltip_state = {"after_id": None, "window": None}
+
+            def show_tooltip():
+                tooltip_state["after_id"] = None
+                if not widget.winfo_exists() or tooltip_state["window"]:
+                    return
+
+                x = widget.winfo_rootx() + 8
+                y = widget.winfo_rooty() + widget.winfo_height() + 4
+                window = tk.Toplevel(widget)
+                window.wm_overrideredirect(True)
+                window.wm_geometry("+{}+{}".format(x, y))
+                tk.Label(
+                    window,
+                    text=text,
+                    bg="#fffbd6",
+                    relief=tk.SOLID,
+                    borderwidth=1,
+                    padx=5,
+                    pady=2,
+                    font=("Segoe UI", 8),
+                ).pack()
+                tooltip_state["window"] = window
+
+            def schedule_tooltip(_event=None):
+                if tooltip_state["after_id"] is None:
+                    tooltip_state["after_id"] = widget.after(500, show_tooltip)
+
+            def hide_tooltip(_event=None):
+                after_id = tooltip_state["after_id"]
+                if after_id is not None:
+                    widget.after_cancel(after_id)
+                    tooltip_state["after_id"] = None
+                window = tooltip_state["window"]
+                if window is not None:
+                    window.destroy()
+                    tooltip_state["window"] = None
+
+            widget.bind("<Enter>", schedule_tooltip, add="+")
+            widget.bind("<Leave>", hide_tooltip, add="+")
+            widget.bind("<ButtonPress>", hide_tooltip, add="+")
+
+
+    def _toolbar_image_button(
+        self,
+        parent,
+        image_name,
+        command,
+        disabled_image_name=None,
+        max_size=None,
+        tooltip=None,
+    ):
+            normal_bg = "#d4d0c8"
+            hover_bg = "#b8b4ac"
+            click_bg = "#a0a0a0"
+            
+            # Load the normal image, and the disabled image if one was provided
+            image_active = self._load_toolbar_image(image_name, max_size=max_size)
+            if disabled_image_name:
+                image_disabled = self._load_toolbar_image(
+                    disabled_image_name, max_size=max_size
+                )
+            else:
+                image_disabled = image_active  # Fallback if no disabled image is provided
+
+            # Track our custom state manually
+            state = {"enabled": True}
+
+            def safe_command():
+                if state["enabled"]:
+                    command()
+
+            btn = tk.Button(
+                parent,
+                image=image_active,
+                command=safe_command,
+                relief=tk.FLAT,
+                bg=normal_bg,
+                activebackground=click_bg,
+                bd=1,
+                cursor="hand2"
+            )
+
+            def on_click(_event):
+                if not state["enabled"]:
+                    return "break"
+
+            def on_enter(_event):
+                if state["enabled"]:
+                    btn.configure(bg=hover_bg)
+
+            def on_leave(_event):
+                if state["enabled"]:
+                    btn.configure(bg=normal_bg)
+
+            def set_state(enabled):
+                state["enabled"] = enabled
+                if enabled:
+                    # Swap to the colorful/active image
+                    btn.config(image=image_active, bg=normal_bg, cursor="hand2")
+                else:
+                    # Swap to the grayed-out image
+                    btn.config(image=image_disabled, bg=normal_bg, cursor="arrow")
+
+            # Bind events
+            btn.bind("<Button-1>", on_click)
+            btn.bind("<Enter>", on_enter)
+            btn.bind("<Leave>", on_leave)
+
+            btn.set_state = set_state
+            if tooltip:
+                self._attach_toolbar_tooltip(btn, tooltip)
+            return btn
+    def _on_script_play(self):
+            # If the script was previously paused, resume it
+            if getattr(self, "_script_paused", False):
+                self._script_paused = False
+                
+                # Update button states for resuming
+                self._btn_script_play.set_state(False)
+                self._btn_script_pause.set_state(True)
+                self._btn_script_stop.set_state(True)
+            else:
+                # Try starting a fresh script run. Only update states if it actually fires!
+                if self.routes.run_script():
+                    self._btn_script_play.set_state(False)   # Deactivate Play
+                    self._btn_script_pause.set_state(True)   # Activate Pause
+                    self._btn_script_stop.set_state(True)    # Activate Stop
+                else:
+                    # If run_script returned False (e.g., empty editor), ensure 
+                    # Play stays active and the others stay deactivated.
+                    self._btn_script_play.set_state(True)
+                    self._btn_script_pause.set_state(False)
+                    self._btn_script_stop.set_state(False)
+
+    def _on_script_pause(self):
+            # Set pause flag high to halt execution loop in background thread
+            self._script_paused = True
+            
+            # Explicitly set the exact states for this button action
+            self._btn_script_play.set_state(True)    # Activate Play (to allow resume)
+            self._btn_script_pause.set_state(False)  # Deactivate Pause
+            self._btn_script_stop.set_state(True)    # Keep Stop active    
+
+    def _on_script_stop(self):
+            # Set stop flag high to completely break out of background thread execution
+            self._script_stopped = True
+            self._script_paused = False
+            active_script = getattr(self, "_active_script", None)
+            if active_script is not None:
+                active_script.stop()
+
+            # Close the hardware communication line immediately
+            self.routes.stop_communication()
+            
+            # Explicitly reset the buttons back to the default/idle layout right here
+            self._btn_script_play.set_state(True)    # Activate Play
+            self._btn_script_pause.set_state(False)  # Deactivate Pause
+            self._btn_script_stop.set_state(False)   # Deactivate Stop    
+
+
 
     @staticmethod
     def _draw_play_icon(canvas):
@@ -132,9 +578,154 @@ class HomePage(tk.Tk):
             8, 8, 16, 16, fill="#808080", outline="#505050", width=1
         )
 
+    def _draw_keyboard_icon(self, canvas, active=False):
+        canvas.delete("all")
+        if not hasattr(self, "_keyboard_icon_image"):
+            self._keyboard_icon_image = self._load_toolbar_image(
+                "keyboard.png", max_size=24
+            )
+        canvas.create_image(12, 12, image=self._keyboard_icon_image)
+
+    def set_keyboard_console_enabled(self, enabled):
+        enabled = bool(enabled)
+        if self._keyboard_console_enabled == enabled:
+            return
+
+        self._keyboard_console_enabled = enabled
+        self._keyboard_buffer = ""
+        self._update_keyboard_console_bindings()
+        self._update_keyboard_console_button()
+        if enabled:
+            self.port_status.set(
+                "Communication port {} open - Keyboard Console On".format(
+                    self.project_settings.get("channel")
+                )
+            )
+        elif self.comm_service.is_connected():
+            self.port_status.set(self.get_port_status_text())
+
+    def _update_keyboard_console_button(self):
+        if self._keyboard_console_canvas is None:
+            return
+        self._draw_keyboard_icon(
+            self._keyboard_console_canvas,
+            active=self._keyboard_console_enabled,
+        )
+
+    def _update_keyboard_console_bindings(self):
+        if not self._comm_texts:
+            return
+
+        for text_widget in self._comm_texts.values():
+            text_widget.unbind("<Key>")
+            text_widget.unbind("<Button-1>")
+            if self._keyboard_console_enabled:
+                text_widget.config(state=tk.NORMAL, cursor="xterm")
+                text_widget.bind("<Key>", self._on_keyboard_console_key)
+                text_widget.bind("<Button-1>", self._on_keyboard_console_click, add="+")
+            else:
+                text_widget.config(state=tk.DISABLED, cursor="arrow")
+
+    def _on_keyboard_console_click(self, event):
+        widget = event.widget
+        widget.focus_set()
+        widget.mark_set(tk.INSERT, tk.END)
+        return "break"
+
+    def _on_keyboard_console_key(self, event):
+        if not self._keyboard_console_enabled or not self.comm_service.is_connected():
+            return "break"
+
+        widget = event.widget
+
+        if event.keysym in ("Return", "KP_Enter"):
+            text = self._keyboard_buffer
+            if text:
+                payload = text.encode("latin-1", errors="replace")
+                self.comm_service.send_bytes(payload, label="Keyboard")
+                widget.insert(tk.END, "\n")
+                self._keyboard_buffer = ""
+            return "break"
+
+        if event.keysym == "BackSpace":
+            if self._keyboard_buffer:
+                self._keyboard_buffer = self._keyboard_buffer[:-1]
+                widget.delete("insert-1c", tk.INSERT)
+            return "break"
+
+        if event.char and event.char not in ("\r", "\n"):
+            self._keyboard_buffer += event.char
+            widget.insert(tk.INSERT, event.char)
+            widget.mark_set(tk.INSERT, tk.END)
+            return "break"
+
+        return "break"
+
+    def _with_comm_text_enabled(self, callback):
+        widgets = list(self._comm_texts.values())
+        log = getattr(self, "_comm_log", None)
+        log_widget = self._comm_texts.get(log["tab"]) if log else None
+        log_start = log_widget.index("end-1c") if log_widget is not None else None
+        for text_widget in widgets:
+            text_widget.config(state=tk.NORMAL)
+        try:
+            callback()
+        finally:
+            if log_widget is not None:
+                # Whatever was just added to the logged tab also goes to the file.
+                self._write_comm_log(log_widget.get(log_start, "end-1c"))
+            if not self._keyboard_console_enabled:
+                for text_widget in widgets:
+                    text_widget.config(state=tk.DISABLED)
+
+    # ------------------------------------------------------------------
+    # Continuous logging (StartLogging / StopLogging script commands)
+    # ------------------------------------------------------------------
+
+    def is_comm_logging(self):
+        return getattr(self, "_comm_log", None) is not None
+
+    def start_comm_log(self, path, tab_name, owner=None):
+        """Start writing everything shown in one tab to a file (Tk thread only).
+
+        Data is added to the end of the file if it already exists.
+        """
+        self.stop_comm_log()
+        handle = open(path, "a", encoding="utf-8", newline="")
+        self._comm_log = {"tab": tab_name, "handle": handle, "path": path, "owner": owner}
+
+    def stop_comm_log(self, owner=None):
+        """Close the log file. With owner, only closes a log that owner started."""
+        log = getattr(self, "_comm_log", None)
+        if log is None or (owner is not None and log["owner"] is not owner):
+            return None
+        self._comm_log = None
+        try:
+            log["handle"].close()
+        except OSError:
+            pass
+        return log["path"]
+
+    def _write_comm_log(self, text):
+        log = getattr(self, "_comm_log", None)
+        if log is None or not text:
+            return
+        try:
+            log["handle"].write(text)
+            log["handle"].flush()
+        except OSError:
+            path = self.stop_comm_log()
+            self._append_comm_line(
+                "Logging stopped: could not write to {}. The disk may be full or the "
+                "file may have been removed.".format(path),
+                tag="error",
+                show_channel=False,
+            )
+
     def _build_status_bar(self):
         status_frame = tk.Frame(self, bg="#d9d9d9")
         status_frame.pack(fill=tk.X, padx=8, pady=(2, 0))
+        self._status_frame = status_frame
 
         self.port_status = tk.StringVar(value="Communication port closed")
         tk.Label(
@@ -145,26 +736,414 @@ class HomePage(tk.Tk):
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT)
 
+        self._flow_control_frame = tk.Frame(status_frame, bg="#d9d9d9")
+        self._flow_control_frame.pack(side=tk.RIGHT)
+
+        self._flow_control_title = tk.Label(
+            self._flow_control_frame,
+            text="Manual RTS/DTR Control",
+            bg="#d9d9d9",
+            font=("Segoe UI", 8),
+        )
+        self._flow_control_title.pack(side=tk.TOP, anchor=tk.E, pady=(0, 2))
+
+        indicators_row = tk.Frame(self._flow_control_frame, bg="#d9d9d9")
+        indicators_row.pack(side=tk.TOP)
+        self._handshake_indicators_row = indicators_row
+
+        for signal, toggleable in (
+            ("RTS", True),
+            ("DTR", True),
+            ("CTS", False),
+            ("DSR", False),
+            ("DCD", False),
+            ("RI", False),
+        ):
+            cell = tk.Frame(indicators_row, bg="#d9d9d9", padx=6)
+            cell.pack(side=tk.LEFT)
+
+            tk.Label(
+                cell,
+                text=signal,
+                bg="#d9d9d9",
+                font=("Segoe UI", 8),
+            ).pack()
+
+            canvas = tk.Canvas(
+                cell,
+                width=16,
+                height=16,
+                bg="#d9d9d9",
+                highlightthickness=0,
+                bd=0,
+            )
+            canvas.pack(pady=(2, 0))
+
+            key = signal.lower()
+            self._handshake_indicators[key] = {
+                "canvas": canvas,
+                "toggleable": toggleable,
+            }
+
+            if toggleable:
+                canvas.configure(cursor="hand2")
+                canvas.bind(
+                    "<Double-Button-1>",
+                    lambda _e, sig=key: self._toggle_handshake_output(sig),
+                )
+
+        self._flow_control_frame.pack_forget()
+
+    def _sync_flow_control_session(self):
+        self.comm_service.configure_session(self.project_settings.as_dict())
+        self._update_flow_control_bar()
+
+    def _flow_control_bar_mode(self):
+        if self.is_monitoring_mode():
+            return None
+        mode = self.project_settings.get("flow_control", "off")
+        if mode in _FLOW_CONTROL_BAR_LABELS:
+            return mode
+        return None
+
+    def _update_flow_control_bar(self):
+        mode = self._flow_control_bar_mode()
+        if mode:
+            self._flow_control_title.config(text=_FLOW_CONTROL_BAR_LABELS[mode])
+            self._configure_handshake_interaction(mode)
+            if mode == "manual":
+                self._handshake_indicators_row.pack(side=tk.TOP)
+                self._refresh_handshake_indicators()
+                self._schedule_handshake_poll()
+            else:
+                self._handshake_indicators_row.pack_forget()
+                self._cancel_handshake_poll()
+            self._flow_control_frame.pack(side=tk.RIGHT)
+        else:
+            self._flow_control_frame.pack_forget()
+            self._cancel_handshake_poll()
+
+    def _configure_handshake_interaction(self, flow_mode):
+        for key, widgets in self._handshake_indicators.items():
+            toggleable = flow_mode == "manual" and key in ("rts", "dtr")
+            widgets["toggleable"] = toggleable
+            widgets["canvas"].configure(cursor="hand2" if toggleable else "")
+
+    def _schedule_handshake_poll(self):
+        self._cancel_handshake_poll()
+        if not self._flow_control_bar_mode():
+            return
+        self._handshake_poll_id = self.after(200, self._poll_handshake_lines)
+
+    def _cancel_handshake_poll(self):
+        if self._handshake_poll_id is not None:
+            try:
+                self.after_cancel(self._handshake_poll_id)
+            except tk.TclError:
+                pass
+            self._handshake_poll_id = None
+
+    def _poll_handshake_lines(self):
+        self._handshake_poll_id = None
+        if not self._flow_control_bar_mode():
+            return
+        self._refresh_handshake_indicators()
+        self._schedule_handshake_poll()
+
+    def _refresh_handshake_indicators(self):
+        state = self.comm_service.get_handshake_state()
+        for key, widgets in self._handshake_indicators.items():
+            self._draw_handshake_indicator(widgets["canvas"], state.get(key, False))
+
+    @staticmethod
+    def _draw_handshake_indicator(canvas, active):
+        canvas.delete("all")
+        if active:
+            canvas.create_oval(2, 2, 14, 14, fill="#1a5fb4", outline="#1a5fb4")
+        else:
+            canvas.create_oval(2, 2, 14, 14, fill="#d9d9d9", outline="#666666")
+
+    def _toggle_handshake_output(self, signal):
+        if self.project_settings.get("flow_control") != "manual":
+            return
+
+        widgets = self._handshake_indicators.get(signal)
+        if not widgets or not widgets.get("toggleable"):
+            return
+
+        state = self.comm_service.get_handshake_state()
+        if signal == "rts":
+            self.comm_service.set_manual_handshake(rts=not state["rts"])
+        elif signal == "dtr":
+            self.comm_service.set_manual_handshake(dtr=not state["dtr"])
+        self._refresh_handshake_indicators()
+
     def _on_close(self):
+        if not self.confirm_discard_unsaved_changes():
+            return
+        self._cancel_handshake_poll()
+        if self._pump_id is not None:
+            self.after_cancel(self._pump_id)
+            self._pump_id = None
         self.stop_repeat_senders()
         self.comm_service.disconnect()
+        self.stop_comm_log()
         self.destroy()
 
-    def _on_comm_event(self, event):
-        self.after(0, lambda evt=event: self._handle_comm_event(evt))
+    def _pump_events(self):
+        """Drain events queued by the serial threads; runs only on the Tk thread."""
+        try:
+            for _ in range(200):  # cap per tick so the UI stays responsive
+                try:
+                    event = self._evt_q.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle_comm_event(event)
+        finally:
+            # Always reschedule, even if a handler raised
+            self._pump_id = self.after(30, self._pump_events)
+
+    def drain_comm_events(self):
+        """Show every event already queued by the serial threads (Tk thread only)."""
+        for _ in range(100000):  # safety cap
+            try:
+                event = self._evt_q.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_comm_event(event)
 
     def _handle_comm_event(self, event):
         if isinstance(event, TxEvent):
             self._append_comm_data(event.data, "TX")
         elif isinstance(event, RxEvent):
+            direction = self._rx_direction(event)
             matches = find_matches(
                 event.data, self._receive_rows, self._normalize_receive_row
             )
-            self._append_comm_data(event.data, "RX")
-            self._handle_receive_matches(matches)
+            self._notify_receive_sequence_waiters(matches)
+
+            if matches:
+                # Where each match starts in the received chunk, in order.
+                located = []
+                search_from = 0
+                for match in matches:
+                    idx = event.data.find(match.data, search_from)
+                    if idx != -1:
+                        located.append((idx, match))
+                        search_from = idx + len(match.data)
+
+                is_first_chunk = True
+
+                # 1. Print any unmatched bytes before the first packet
+                first_start = located[0][0] if located else len(event.data)
+                if first_start:
+                    self._append_comm_data(event.data[:first_start], direction)
+                    is_first_chunk = False
+
+                for position, (idx, match) in enumerate(located):
+                    # The packet runs from its match up to the next match (or the end of
+                    # the chunk), so the bytes after the defined sequence (e.g. the data
+                    # and CRC of a reply) stay on the same line as the comment.
+                    end = located[position + 1][0] if position + 1 < len(located) else len(event.data)
+                    packet = event.data[idx:end]
+
+                    # 2. Check for checksum failures
+                    if match.checksum_ok is False:
+                        self._append_comm_line(
+                            'Checksum wrong for receive sequence "{}".'.format(match.name)
+                        )
+                        self._append_comm_data(packet, direction, show_header=is_first_chunk)
+                        is_first_chunk = False
+                        continue
+
+                    # 3. Extract the comment for a successful match
+                    row = self.get_receive_row(match.row_index)
+                    action = parse_receive_action(row, match.name)
+                    comment = action.comment_text.strip() or default_comment_text(match.name)
+
+                    if action.comment_timestamp:
+                        comment = "{}  {}".format(comment, self._format_comm_timestamp())
+
+                    # 4. Print the whole packet with its comment at the end of the line
+                    inline_suffix = " {}".format(comment) if comment else ""
+                    self._append_comm_data(
+                        packet,
+                        direction,
+                        inline_suffix=inline_suffix,
+                        extra_line_break=False,
+                        show_header=is_first_chunk
+                    )
+                    is_first_chunk = False
+
+                    # 5. Execute any triggered actions
+                    if self._run_receive_action(match, action):
+                        self._append_comm_line(
+                            'Communication stopped by receive sequence "{}".'.format(match.name),
+                            show_channel=False
+                        )
+                        self.routes.stop_communication()
+                        return
+
+            else:
+                self._append_comm_data(event.data, direction)
+
         elif isinstance(event, ErrorEvent):
-            self._append_comm_line("[ERR] {}".format(event.message), tag="error", direction="RX")
-            self.routes.stop_communication()
+            self._append_comm_line(event.message, tag="error", direction="RX")
+            if event.fatal:
+                self.routes.stop_communication()
+
+    def _notify_receive_sequence_waiters(self, matches):
+        if not matches:
+            return
+
+        with self._receive_wait_condition:
+            for match in matches:
+                self._receive_match_totals[match.row_index] = (
+                    self._receive_match_totals.get(match.row_index, 0) + 1
+                )
+                for waiter in self._receive_sequence_waiters:
+                    if waiter["row_index"] == match.row_index:
+                        waiter["count"] += 1
+            self._receive_wait_condition.notify_all()
+
+    def receive_match_totals(self):
+        """Snapshot of how often each receive sequence has been detected."""
+        with self._receive_wait_condition:
+            return dict(self._receive_match_totals)
+
+    def find_receive_row_index(self, name_or_index):
+        """Return the row index of a receive sequence given by name or zero-based index.
+
+        Names are matched exactly first, then ignoring upper/lower case and
+        surrounding spaces.
+        """
+        if isinstance(name_or_index, bool):
+            raise ValueError("Receive sequence must be a name or zero-based index.")
+
+        if isinstance(name_or_index, int):
+            if not (0 <= name_or_index < len(self._receive_rows)):
+                raise ValueError(
+                    "Receive sequence number {} does not exist.".format(name_or_index)
+                )
+            return name_or_index
+
+        if not isinstance(name_or_index, str):
+            raise ValueError("Receive sequence must be a name or zero-based index.")
+
+        names = [self._normalize_receive_row(row)[1] for row in self._receive_rows]
+        if name_or_index in names:
+            return names.index(name_or_index)
+        wanted = name_or_index.strip().casefold()
+        for index, name in enumerate(names):
+            if str(name).strip().casefold() == wanted:
+                return index
+        raise ValueError('Receive sequence "{}" was not found.'.format(name_or_index))
+
+    def wait_for_receive_sequence(
+        self,
+        name_or_index,
+        max_counter=1,
+        timeout=-1,
+        since=None,
+        should_stop=None,
+        is_paused=None,
+    ):
+        """Wait until a receive sequence has been detected max_counter times.
+
+        since: optional snapshot from receive_match_totals(); detections made
+        after that snapshot (even before this call) are counted as well.
+        Returns the number of detections counted (may be lower on timeout).
+        """
+        if should_stop is None:
+            should_stop = lambda: getattr(self, "_script_stopped", False)
+        if is_paused is None:
+            is_paused = lambda: False
+
+        row_index = self.find_receive_row_index(name_or_index)
+        row = self.get_receive_row(row_index)
+        if row[0] != "☑":
+            raise ValueError('Receive sequence "{}" is inactive.'.format(row[1]))
+
+        if isinstance(max_counter, bool) or isinstance(timeout, bool):
+            raise ValueError("maxCounter and timeout must be integer values.")
+        try:
+            max_counter = int(max_counter)
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            raise ValueError("maxCounter and timeout must be integer values.")
+        if max_counter == 0 or max_counter < -1:
+            raise ValueError("maxCounter must be positive or -1.")
+        if timeout < -1:
+            raise ValueError("timeout must be non-negative or -1.")
+
+        with self._receive_wait_condition:
+            already = 0
+            if since is not None:
+                already = max(
+                    0,
+                    self._receive_match_totals.get(row_index, 0)
+                    - since.get(row_index, 0),
+                )
+            waiter = {"row_index": row_index, "count": already}
+            self._receive_sequence_waiters.append(waiter)
+
+        def counted():
+            if max_counter == -1:
+                return waiter["count"]
+            return min(max_counter, waiter["count"])
+
+        try:
+            if not self.comm_service.is_connected():
+                communication_started = threading.Event()
+
+                def start_communication():
+                    try:
+                        if not should_stop():
+                            self.routes.start_communication()
+                    finally:
+                        communication_started.set()
+
+                self.after(0, start_communication)
+                while not communication_started.wait(0.1):
+                    if should_stop():
+                        raise SystemExit()
+                if should_stop():
+                    raise SystemExit()
+                if not self.comm_service.is_connected():
+                    raise RuntimeError("Could not start serial communication.")
+
+            deadline = None if timeout == -1 else time.monotonic() + timeout / 1000.0
+            last_tick = time.monotonic()
+            with self._receive_wait_condition:
+                while True:
+                    if should_stop():
+                        raise SystemExit()
+
+                    now = time.monotonic()
+                    paused = is_paused()
+                    if paused and deadline is not None:
+                        # The Pause button holds the timeout clock too.
+                        deadline += now - last_tick
+                    last_tick = now
+
+                    if not paused:
+                        if max_counter != -1 and waiter["count"] >= max_counter:
+                            return counted()
+                        if not self.comm_service.is_connected():
+                            raise RuntimeError(
+                                "Communication stopped while waiting for a receive sequence."
+                            )
+                        if deadline is not None and now >= deadline:
+                            return counted()
+
+                    wait_time = 0.1
+                    if deadline is not None and not paused:
+                        wait_time = max(0.001, min(wait_time, deadline - now))
+                    self._receive_wait_condition.wait(wait_time)
+        finally:
+            with self._receive_wait_condition:
+                if waiter in self._receive_sequence_waiters:
+                    self._receive_sequence_waiters.remove(waiter)
 
     @staticmethod
     def _format_comm_timestamp():
@@ -174,6 +1153,63 @@ class HomePage(tk.Tk):
             now.strftime("%H:%M:%S"),
             now.microsecond // 1000,
         )
+
+    def is_monitoring_mode(self):
+        return self.project_settings.get("comm_mode") == COMM_MODE_MONITORING
+
+    def get_port_summary(self):
+        """Port name(s) for the COM button, e.g. 'COM4' or 'COM4 / COM5'."""
+        channel = self.project_settings.get("channel")
+        if self.is_monitoring_mode():
+            return "{} / {}".format(channel, self.project_settings.get("channel2"))
+        return channel
+
+    def get_port_status_text(self):
+        if not self.comm_service.is_connected():
+            return "Communication port closed"
+        if self.is_monitoring_mode():
+            return "Monitoring {} (channel 1) and {} (channel 2)".format(
+                self.project_settings.get("channel"),
+                self.project_settings.get("channel2"),
+            )
+        return "Communication port {} open".format(self.project_settings.get("channel"))
+
+    @staticmethod
+    def _channel_index(direction):
+        """0 for channel 1 (TX / CH1), 1 for channel 2 (RX / CH2)."""
+        return 0 if direction in ("TX", "CH1") else 1
+
+    def _rx_direction(self, event):
+        if self.comm_service.is_monitoring():
+            return "CH1" if event.channel == 1 else "CH2"
+        return "RX"
+
+    def _get_channel_label(self, direction):
+        """Return the channel alias if set, else TX/RX or the monitored port name."""
+        aliases = self.project_settings.get("channel_aliases", ("", ""))
+        index = self._channel_index(direction)
+        if index < len(aliases):
+            alias = aliases[index].strip()
+            if alias:
+                return alias
+        if direction == "CH1":
+            return self.project_settings.get("channel") or "Channel 1"
+        if direction == "CH2":
+            return self.project_settings.get("channel2") or "Channel 2"
+        return direction
+
+    def _should_show_comm_data(self, direction):
+        """Whether raw TX/RX byte lines should appear in the communication panel."""
+        filt = self.project_settings.get("contents_filter", "all")
+        if filt == "all":
+            return True
+        if filt == "channel1":
+            return self._channel_index(direction) == 0
+        if filt == "channel2":
+            return self._channel_index(direction) == 1
+        if filt == "comments_only":
+            return False
+        return True
 
     @staticmethod
     def _configure_comm_tags(text_widget):
@@ -186,8 +1222,9 @@ class HomePage(tk.Tk):
 
     def _insert_comm_header(self, text_widget, direction):
         timestamp = self._format_comm_timestamp()
+        label = self._get_channel_label(direction)
         text_widget.insert(tk.END, timestamp + " ", "meta")
-        text_widget.insert(tk.END, "[{}]".format(direction), "meta")
+        text_widget.insert(tk.END, "[{}]".format(label), "meta")
         text_widget.insert(tk.END, " - ", "meta")
 
     def _insert_comm_payload(self, text_widget, data, mode, data_tag):
@@ -199,97 +1236,96 @@ class HomePage(tk.Tk):
         for text, _segment_tag in format_line_ending_segments(ending):
             text_widget.insert(tk.END, text, "meta")
 
-    def _append_comm_line(self, line, tag="status", direction="RX"):
+    def _append_comm_line(self, line, tag="status", direction="RX", show_channel=True):
         if not self._comm_texts:
             return
 
-        for text_widget in self._comm_texts.values():
-            self._insert_comm_header(text_widget, direction)
-            text_widget.insert(tk.END, line, tag)
-            text_widget.insert(tk.END, "\n")
-            text_widget.see(tk.END)
+        def insert_lines():
+            for text_widget in self._comm_texts.values():
+                if show_channel:
+                    self._insert_comm_header(text_widget, direction)
+                text_widget.insert(tk.END, line, tag)
+                text_widget.insert(tk.END, "\n")
+                text_widget.see(tk.END)
 
-    def _append_comm_data(self, data, direction, label=""):
+        self._with_comm_text_enabled(insert_lines)
+
+    def _append_comm_blank_line(self):
         if not self._comm_texts:
+            return
+
+        def insert_blank():
+            for text_widget in self._comm_texts.values():
+                text_widget.insert(tk.END, "\n")
+                text_widget.see(tk.END)
+
+        self._with_comm_text_enabled(insert_blank)
+
+    def _append_comm_data(
+        self,
+        data,
+        direction,
+        inline_suffix="",
+        extra_line_break=False,
+        show_header=True,
+    ):
+        if not self._comm_texts:
+            return
+
+        if not self._should_show_comm_data(direction):
+            if (
+                self.project_settings.get("contents_filter") == "comments_only"
+                and inline_suffix
+            ):
+                self._append_comm_line(
+                    inline_suffix, tag="status", direction=direction
+                )
+                if extra_line_break:
+                    self._append_comm_blank_line()
             return
 
         lines = list(iter_comm_lines(data))
         if not lines and data:
             lines = [(data, b"")]
 
-        data_tag = "rx_data" if direction == "RX" else "tx_data"
+        data_tag = "tx_data" if self._channel_index(direction) == 0 else "rx_data"
+        last_line_index = len(lines) - 1
 
-        for tab_name, text_widget in self._comm_texts.items():
-            for index, (line_bytes, ending) in enumerate(lines):
-                if index == 0:
-                    self._insert_comm_header(text_widget, direction)
+        def insert_data():
+            for tab_name, text_widget in self._comm_texts.items():
+                for index, (line_bytes, ending) in enumerate(lines):
+                    # ONLY print the timestamp header if the flag is True
+                    if index == 0 and show_header:
+                        self._insert_comm_header(text_widget, direction)
 
-                self._insert_comm_payload(text_widget, line_bytes, tab_name, data_tag)
-                self._insert_comm_line_ending(text_widget, ending)
+                    self._insert_comm_payload(text_widget, line_bytes, tab_name, data_tag)
+                    self._insert_comm_line_ending(text_widget, ending)
 
-                if label and index == 0:
-                    text_widget.insert(tk.END, "  {}".format(label), "meta")
+                    if inline_suffix and index == last_line_index:
+                        text_widget.insert(tk.END, "  {}".format(inline_suffix), "meta")
 
-                text_widget.insert(tk.END, "\n")
+                    text_widget.insert(tk.END, "\n")
 
-            text_widget.see(tk.END)
+                if extra_line_break and inline_suffix:
+                    text_widget.insert(tk.END, "\n")
 
-    def _append_comm_comment(self, text, include_timestamp=False, extra_line_break=False):
-        if not self._comm_texts or not text:
-            return
+                text_widget.see(tk.END)
 
-        line = text
-        if include_timestamp:
-            line = "{}  {}".format(line, self._format_comm_timestamp())
+        self._with_comm_text_enabled(insert_data)
 
-        for text_widget in self._comm_texts.values():
-            self._insert_comm_header(text_widget, "RX")
-            text_widget.insert(tk.END, line, "meta")
-            text_widget.insert(tk.END, "\n")
-            if extra_line_break:
-                text_widget.insert(tk.END, "\n")
-            text_widget.see(tk.END)
-
-    def _handle_receive_matches(self, matches):
-        for match in matches:
-            if match.checksum_ok is False:
-                self._append_comm_line(
-                    'Checksum wrong for receive sequence "{}".'.format(match.name)
-                )
-                continue
-
-            row = self.get_receive_row(match.row_index)
-            action = parse_receive_action(row, match.name)
-            if self._run_receive_action(match, action):
-                self._append_comm_line(
-                    'Communication stopped by receive sequence "{}".'.format(
-                        match.name
-                    )
-                )
-                self.routes.stop_communication()
-                break
 
     def _run_receive_action(self, match, action: ReceiveActionConfig) -> bool:
         if action.action_type == "Comment":
-            comment = action.comment_text.strip() or default_comment_text(match.name)
-            self._append_comm_comment(
-                comment,
-                include_timestamp=action.comment_timestamp,
-                extra_line_break=action.comment_line_break,
-            )
             return False
 
-        if action.action_type == "Trigger" and action.snapshot_trigger:
-            self._append_comm_line(
-                'Snapshot triggered by receive sequence "{}".'.format(match.name)
-            )
+        if action.action_type == "Answer":
+            # No automatic answers in Monitoring mode: nothing is sent.
+            if action.answer_send_index >= 0 and self.comm_service.can_send():
+                self._send_answer_sequence(action.answer_send_index, match.name)
             return False
 
         if action.action_type == "Stop" and action.stop_communication:
             return True
-
-        if action.action_type == "Answer":
-            self._send_answer_sequence(action.answer_send_index, match.name)
 
         return False
 
@@ -311,7 +1347,7 @@ class HomePage(tk.Tk):
         checksum_rule = send_row[4]
 
         for token in sequence.split():
-            if PLACEHOLDER_PATTERN.match(token):
+            if token == WILDCARD or PLACEHOLDER_PATTERN.match(token):
                 self._append_comm_line(
                     'Automatic answer for "{}" failed: send sequence "{}" '
                     "contains wildcards.".format(trigger_name, name)
@@ -328,26 +1364,36 @@ class HomePage(tk.Tk):
             return
 
         try:
-            self.comm_service.send_bytes(payload, label=name)
+            if not self.comm_service.send_bytes(payload, label=name):
+                self._append_comm_line(
+                    'Automatic answer for "{}" skipped: send queue is full.'.format(
+                        trigger_name
+                    ),
+                    tag="error",
+                    show_channel=False,
+                )
+                return
         except Exception as exc:
             self._append_comm_line(
                 'Automatic answer for "{}" failed: {}'.format(trigger_name, exc)
             )
 
     def apply_project_settings(self, settings):
+        self.set_keyboard_console_enabled(False)
         was_open = self.comm_service.is_connected()
         if was_open:
             self.routes.stop_communication()
 
         self.project_settings.update(settings)
-        self.com_port.set(self.project_settings.get("channel"))
+        self.com_port.set(self.get_port_summary())
+        self.comm_service.configure_session(self.project_settings.as_dict())
+        self._update_flow_control_bar()
+        self.mark_project_dirty()
 
         if was_open:
             self.routes.start_communication()
         elif self._communication_open:
-            self.port_status.set(
-                "Communication port {} open".format(self.project_settings.get("channel"))
-            )
+            self.port_status.set(self.get_port_status_text())
 
     def _build_layout(self):
         top_bar = tk.Frame(self, bg="#d9d9d9")
@@ -357,16 +1403,19 @@ class HomePage(tk.Tk):
 
         com_frame = tk.Frame(top_bar, bg="#d9d9d9")
         com_frame.pack(side=tk.RIGHT)
-        self.com_port = tk.StringVar(value=self.project_settings.get("channel"))
-        ttk.Button(
+        self.com_port = tk.StringVar(value=self.get_port_summary())
+        settings_button = ttk.Button(
             com_frame,
             textvariable=self.com_port,
-            width=10,
+            width=16,
             command=self.routes.open_project_settings,
-        ).pack()
+        )
+        settings_button.pack()
+        self._attach_toolbar_tooltip(settings_button, "Project Communication Settings")
 
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._main_paned = paned
 
         left_pane = ttk.PanedWindow(paned, orient=tk.VERTICAL)
         paned.add(left_pane, weight=1)
@@ -376,8 +1425,190 @@ class HomePage(tk.Tk):
         left_pane.add(send_frame, weight=1)
         left_pane.add(receive_frame, weight=1)
 
+        right_pane = ttk.PanedWindow(paned, orient=tk.VERTICAL)
+        paned.add(right_pane, weight=2)
+
         comm_frame = self._build_communication_panel()
-        paned.add(comm_frame, weight=2)
+        script_frame = self._build_script_editor_panel()
+        right_pane.add(comm_frame, weight=3)
+        right_pane.add(script_frame, weight=1)
+
+        self._chatbot_panel = ChatbotPanel(paned, self)
+
+    def _toggle_chatbot_panel(self):
+        if str(self._chatbot_panel) in self._main_paned.panes():
+            self._hide_chatbot_panel()
+            return
+
+        self._main_paned.add(self._chatbot_panel, weight=1)
+        self._chatbot_panel.focus_message_entry()
+
+    def _hide_chatbot_panel(self):
+        if str(self._chatbot_panel) in self._main_paned.panes():
+            self._main_paned.forget(self._chatbot_panel)
+
+    def _build_script_editor_panel(self):
+            import tksheet
+            
+            frame = ttk.LabelFrame(self, text="", padding=4)
+
+            header = tk.Frame(frame)
+            header.pack(fill=tk.X, pady=(0, 4))
+            tk.Label(
+                header,
+                text="Script Editor",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(side=tk.LEFT)
+
+            # Start with a handful of blank rows so it reads as a real
+            # spreadsheet grid rather than a single empty line.
+            initial_rows = [[""] for _ in range(15)]
+
+            # Create the Sheet container safely matching the window backdrop
+            self._script_sheet = tksheet.Sheet(
+                frame,
+                data=initial_rows,
+                headers=["Command Script (Type, Edit, or Paste directly)"],
+                height=180,
+                enable_delete_key=True,
+                # Excel-style row numbers down the left edge
+                show_row_index=True,
+                row_index_width=40,
+                # Fix: Keep margins at 0 integer values to prevent string errors
+                empty_horizontal=0,
+                empty_vertical=0,
+                # Fix: Set the underlying canvas background color natively
+                table_background="#ffffff",
+                # Visible cell gridlines like a real spreadsheet
+                grid_color="#c0c0c0",
+                header_bg="#e8e8e8",
+                header_fg="#000000",
+                index_bg="#e8e8e8",
+                index_fg="#000000",
+            )
+            
+            # Enable all standard Excel-like interactive features
+            self._script_sheet.enable_bindings((
+                "single_select",
+                "drag_select",
+                "select_all",
+                "row_select",
+                "edit_cell",         
+                "undo",
+                "copy",
+                "paste",
+                "cut",
+                "rc_select",
+                "rc_insert_row",
+                "rc_delete_row",
+                "arrowkeys",
+                "delete",             
+                "clear_clipboard",   
+                "insert_row",        
+                "delete_row",
+                # Lets the user drag row heights / the column edge, like Excel
+                "row_height_resize",
+                "column_width_resize",
+                "double_click_column_resize",
+            ))
+            
+            self._script_sheet.column_width(column=0, width=570)
+            self._script_sheet.pack(fill=tk.BOTH, expand=True)
+
+            # Connect UI modifications to update the unsaved changes state flag
+            self._script_sheet.extra_bindings([
+                ("end_edit_cell", lambda event: self.mark_project_dirty()),
+                ("after_paste", lambda event: self.mark_project_dirty()),
+                ("after_delete", lambda event: self.mark_project_dirty())
+            ])
+
+            return frame
+
+    def get_script_text(self, keep_blank_rows=False):
+        """Extracts text lines out of the single-column grid matrix sequentially.
+
+        keep_blank_rows=True keeps empty rows as empty lines so that line N of
+        the text is row N of the grid (used to report errors by row number).
+        """
+        if not hasattr(self, "_script_sheet"):
+            return ""
+
+        self._script_sheet.close_text_editor(set_data=True)
+
+        lines = []
+        sheet_data = self._script_sheet.get_sheet_data()
+        for row in sheet_data:
+            cmd_str = ""
+            if row and row[0] is not None:
+                cmd_str = str(row[0]).strip()
+            if cmd_str or keep_blank_rows:
+                lines.append(cmd_str)
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines)
+
+    def insert_script_lines(self, lines, replace=False):
+        """Put script lines into the grid: at the end, or instead of the script."""
+        if not hasattr(self, "_script_sheet"):
+            return
+        new_rows = [[str(line)] for line in lines]
+        if replace:
+            rows = new_rows
+        else:
+            current = self.get_script_text(keep_blank_rows=True)
+            rows = [[line] for line in current.split("\n")] if current else []
+            rows += new_rows
+        rows += [[""] for _ in range(max(0, 15 - len(rows)))]  # keep the grid look
+        self._script_sheet.set_sheet_data(rows)
+        self._script_sheet.redraw()
+        self.mark_project_dirty()
+
+    def get_bot_snapshot(self, share_comm_data=True):
+        """Project information given to the assistant (call on the Tk thread)."""
+        from core.bot_context import trim_comm_lines
+
+        send = []
+        for index in range(len(self._send_rows)):
+            row = self.get_send_row(index)
+            send.append({"name": str(row[1]), "data": str(row[2]), "checksum": str(row[4])})
+        receive = []
+        for index in range(len(self._receive_rows)):
+            row = self.get_receive_row(index)
+            action = parse_receive_action(row, row[1])
+            if action.action_type == "Answer":
+                answer = format_answer_display(action, self._send_rows, self._normalize_send_row)
+                action_text = "answer with " + (answer or "nothing")
+            elif action.action_type == "Comment":
+                action_text = 'comment "{}"'.format(action.comment_text)
+            else:
+                action_text = "stop communication"
+            receive.append({
+                "name": str(row[1]), "data": str(row[2]), "checksum": str(row[3]),
+                "active": row[0] == "☑", "action": action_text,
+            })
+
+        snapshot = {
+            "settings": self.project_settings.as_dict(),
+            "connected": self.comm_service.is_connected(),
+            "send": send,
+            "receive": receive,
+            "script": self.get_script_text(keep_blank_rows=True),
+        }
+        if share_comm_data:
+            widget = self._comm_texts.get("ASCII")
+            text = widget.get("1.0", "end-1c") if widget is not None else ""
+            snapshot["comm_lines"] = trim_comm_lines(text)
+        return snapshot
+
+    def clear_script_editor(self):
+        """Resets the editor back to a single empty spreadsheet field."""
+        if hasattr(self, "_script_sheet"):
+            self._script_sheet.set_sheet_data([[""]])
+            self._script_sheet.redraw()
+
+    def focus_script_editor(self):
+        if hasattr(self, "_script_sheet"):
+            self._script_sheet.focus_set()
 
     def _build_send_sequences(self):
         frame = ttk.LabelFrame(self, text="", padding=4)
@@ -390,9 +1621,11 @@ class HomePage(tk.Tk):
             bg="#d9d9d9",
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT)
-        ttk.Button(header, text="Add Sequence", command=self.routes.add_send_sequence).pack(
-            side=tk.RIGHT
+        add_send_button = ttk.Button(
+            header, text="Add Sequence", command=self.routes.add_send_sequence
         )
+        add_send_button.pack(side=tk.RIGHT)
+        self._attach_toolbar_tooltip(add_send_button, "Add Send Sequence")
 
         table_frame = tk.Frame(frame)
         table_frame.pack(fill=tk.BOTH, expand=True)
@@ -408,11 +1641,7 @@ class HomePage(tk.Tk):
         self.send_tree.column("name", width=120, anchor=tk.W)
         self.send_tree.column("sequence", width=200, anchor=tk.W)
 
-        self._send_rows = [
-            ("", "TestData", "7 8 9 4 5", False, DEFAULT_CHECKSUM, "HEX"),
-            ("", "Ping", "2D 2D 2D 2D", False, DEFAULT_CHECKSUM, "HEX"),
-            ("", "Pong", "50 6F 6E 67", False, DEFAULT_CHECKSUM, "HEX"),
-        ]
+        self._send_rows = []
         for row in self._send_rows:
             self.send_tree.insert("", tk.END, values=self._send_row_display_values(row))
 
@@ -455,10 +1684,19 @@ class HomePage(tk.Tk):
                 width=2,
                 command=lambda row_id=item: self._send_sequence(row_id),
             )
+            self._attach_toolbar_tooltip(button, "Send Sequence")
             button.place(x=x, y=y, width=max(width, 28), height=height)
             self._send_buttons[item] = button
 
     def _send_sequence(self, row_id):
+        if self.is_monitoring_mode():
+            messagebox.showwarning(
+                "Communication",
+                "Sending is not available in Monitoring mode.",
+                parent=self,
+            )
+            return
+
         if not self.comm_service.is_connected():
             messagebox.showwarning(
                 "Communication",
@@ -469,15 +1707,47 @@ class HomePage(tk.Tk):
 
         row_index = self.send_tree.index(row_id)
         send_row = self.get_send_row(row_index)
+        params = None
+        if count_wildcards(send_row[2]):
+            params = self._ask_send_parameters(send_row[1], send_row[2])
+            if params is None:
+                return  # cancelled
         if send_row[3] and send_row[6] > 0:
-            self._start_repeat_for_row(row_index, send_immediately=True)
+            self._start_repeat_for_row(row_index, send_immediately=True, params=params)
             return
 
         self._stop_repeat_for_row(row_index)
-        self._send_sequence_by_index(row_index)
+        self._send_sequence_by_index(row_index, params=params)
 
-    def _send_sequence_by_index(self, row_index, from_repeat=False):
-        if not self.comm_service.is_connected():
+    def _ask_send_parameters(self, name, sequence):
+        """Ask for the values of the ? bytes (e.g. the bus address). None = cancelled."""
+        from tkinter import simpledialog
+
+        needed = count_wildcards(sequence)
+        last = self._last_send_parameters.get(name, "")
+        prompt = (
+            'The send sequence "{}" has {} parameter byte(s) (?):\n{}\n\n'
+            "Enter {} HEX value(s), e.g. the device address 05{}:"
+        ).format(name, needed, format_sequence_display(sequence, "HEX"), needed,
+                 " or 05 0A" if needed > 1 else "")
+        while True:
+            answer = simpledialog.askstring("Send Sequence Parameter", prompt,
+                                            initialvalue=last, parent=self)
+            if answer is None:
+                return None
+            try:
+                values = parse_parameter_values(answer)
+                fill_wildcards(sequence, values)  # checks the number of values
+            except SequenceEncodeError as exc:
+                messagebox.showwarning("Send Sequence Parameter",
+                                       "Not a valid value: {}.".format(exc), parent=self)
+                last = answer
+                continue
+            self._last_send_parameters[name] = answer.strip()
+            return values
+
+    def _send_sequence_by_index(self, row_index, from_repeat=False, params=None):
+        if not self.comm_service.can_send():
             return False
         if not (0 <= row_index < len(self._send_rows)):
             return False
@@ -488,6 +1758,9 @@ class HomePage(tk.Tk):
         checksum_rule = send_row[4]
 
         try:
+            if count_wildcards(sequence):
+                # The ? bytes are filled in first; the checksum covers the filled data.
+                sequence = fill_wildcards(sequence, params or b"")
             payload = encode_sequence(sequence)
             payload = append_checksum(payload, checksum_rule)
         except (SequenceEncodeError, ChecksumError) as exc:
@@ -504,7 +1777,14 @@ class HomePage(tk.Tk):
             return False
 
         try:
-            self.comm_service.send_bytes(payload, label=name)
+            if not self.comm_service.send_bytes(payload, label=name):
+                self._append_comm_line(
+                    'Send of "{}" skipped: send queue is full '
+                    "(device is not accepting data).".format(name),
+                    tag="error",
+                    show_channel=False,
+                )
+                return False
         except Exception as exc:
             if from_repeat:
                 self._append_comm_line(
@@ -520,6 +1800,35 @@ class HomePage(tk.Tk):
 
         return True
 
+    def send_sequence_for_script(self, row_index, params=None):
+        """Queue one send sequence for the script engine (Tk thread only).
+
+        params: values for the ? bytes of the sequence (bytes), if it has any.
+        Never shows a popup: returns None when queued, or an error text.
+        """
+        if not self.comm_service.can_send():
+            return "communication is not started"
+        if not (0 <= row_index < len(self._send_rows)):
+            return "the send sequence no longer exists"
+
+        send_row = self.get_send_row(row_index)
+        name = send_row[1]
+        try:
+            sequence = send_row[2]
+            if count_wildcards(sequence):
+                sequence = fill_wildcards(sequence, params or b"")
+            payload = encode_sequence(sequence)
+            payload = append_checksum(payload, send_row[4])
+        except (SequenceEncodeError, ChecksumError) as exc:
+            return str(exc)
+
+        try:
+            if not self.comm_service.send_bytes(payload, label=name):
+                return "the send queue is full (device is not accepting data)"
+        except Exception as exc:
+            return str(exc)
+        return None
+
     def _stop_repeat_for_row(self, row_index):
         after_id = self._repeat_after_ids.pop(row_index, None)
         if after_id is not None:
@@ -528,25 +1837,28 @@ class HomePage(tk.Tk):
             except tk.TclError:
                 pass
 
-    def _start_repeat_for_row(self, row_index, send_immediately=False):
+    def _start_repeat_for_row(self, row_index, send_immediately=False, params=None):
+        """params: values for the ? bytes, used for every repeated send."""
         self._stop_repeat_for_row(row_index)
 
-        if not self.comm_service.is_connected():
+        if not self.comm_service.can_send():
             return
 
         send_row = self.get_send_row(row_index)
         if not send_row[3] or send_row[6] <= 0:
             if send_immediately:
-                self._send_sequence_by_index(row_index)
+                self._send_sequence_by_index(row_index, params=params)
             return
+        if count_wildcards(send_row[2]) and params is None:
+            return  # values unknown (e.g. after editing): send → again to restart
 
-        if send_immediately and not self._send_sequence_by_index(row_index):
+        if send_immediately and not self._send_sequence_by_index(row_index, params=params):
             return
 
         interval_ms = max(100, int(send_row[6] * 1000))
         after_id = self.after(
             interval_ms,
-            lambda: self._tick_repeat_send(row_index, interval_ms),
+            lambda: self._tick_repeat_send(row_index, interval_ms, params),
         )
         self._repeat_after_ids[row_index] = after_id
 
@@ -558,9 +1870,9 @@ class HomePage(tk.Tk):
                 pass
         self._repeat_after_ids.clear()
 
-    def _tick_repeat_send(self, row_index, interval_ms):
+    def _tick_repeat_send(self, row_index, interval_ms, params=None):
         self._repeat_after_ids.pop(row_index, None)
-        if not self.comm_service.is_connected():
+        if not self.comm_service.can_send():
             return
 
         if not (0 <= row_index < len(self._send_rows)):
@@ -570,14 +1882,14 @@ class HomePage(tk.Tk):
         if not send_row[3] or send_row[6] <= 0:
             return
 
-        self._send_sequence_by_index(row_index, from_repeat=True)
+        self._send_sequence_by_index(row_index, from_repeat=True, params=params)
 
-        if not self.comm_service.is_connected():
+        if not self.comm_service.can_send():
             return
 
         after_id = self.after(
             interval_ms,
-            lambda: self._tick_repeat_send(row_index, interval_ms),
+            lambda: self._tick_repeat_send(row_index, interval_ms, params),
         )
         self._repeat_after_ids[row_index] = after_id
 
@@ -622,6 +1934,7 @@ class HomePage(tk.Tk):
                 dialog.update_display_mode_from_global(mode)
         finally:
             self._updating_display_mode = False
+        self.mark_project_dirty()
 
     def _on_comm_tab_changed(self, _event):
         modes = ("ASCII", "HEX", "Decimal", "Binary")
@@ -703,12 +2016,23 @@ class HomePage(tk.Tk):
         rows.pop(old_index)
         new_index = max(0, min(new_index, len(rows)))
         rows.insert(new_index, row_data)
+        if new_index != old_index:
+            # Rows in between moved: keep automatic answers on the same sequence,
+            # and stop the other repeat senders (they are tracked by position).
+            order = list(range(len(rows)))
+            order.remove(old_index)
+            order.insert(new_index, old_index)
+            self._remap_receive_answers(
+                {old: new for new, old in enumerate(order)})
+            self.stop_repeat_senders()
         self._refresh_send_tree()
+        self._refresh_receive_tree()
+        self.mark_project_dirty()
         if (
             was_repeating
             and periodic
             and repeat_interval > 0
-            and self.comm_service.is_connected()
+            and self.comm_service.can_send()
         ):
             self._start_repeat_for_row(new_index, send_immediately=False)
 
@@ -716,7 +2040,38 @@ class HomePage(tk.Tk):
         if 0 <= index < len(self._send_rows):
             self.stop_repeat_senders()
             self._send_rows.pop(index)
+            mapping = {index: None}
+            mapping.update({i: i - 1 for i in range(index + 1, len(self._send_rows) + 1)})
+            self._remap_receive_answers(mapping)
             self._refresh_send_tree()
+            self._refresh_receive_tree()
+            self.mark_project_dirty()
+
+    def _remap_receive_answers(self, mapping):
+        """Automatic answers are stored as send sequence positions. After send
+        sequences moved or were deleted, point each answer at the same sequence
+        again (mapping: old position -> new position, None = deleted)."""
+        for row_number, row in enumerate(self._receive_rows):
+            normalized = self._normalize_receive_row(row)
+            action = parse_receive_action(normalized, normalized[1])
+            old = action.answer_send_index
+            if old < 0 or old not in mapping:
+                continue
+            new = mapping[old]
+            action.answer_send_index = NO_ANSWER_SEND_INDEX if new is None else new
+            if action.answer_send_index != old:
+                self._receive_rows[row_number] = (
+                    *normalized[:6], *receive_action_fields(action))
+
+    def receive_sequences_answering_with(self, send_index):
+        """Names of receive sequences whose automatic answer is this send sequence."""
+        names = []
+        for row in self._receive_rows:
+            normalized = self._normalize_receive_row(row)
+            action = parse_receive_action(normalized, normalized[1])
+            if action.action_type == "Answer" and action.answer_send_index == send_index:
+                names.append(normalized[1] or "(no name)")
+        return names
 
     def get_receive_row(self, index):
         if not (0 <= index < len(self._receive_rows)):
@@ -744,7 +2099,11 @@ class HomePage(tk.Tk):
     def _receive_row_display_values(self, row):
         normalized = self._normalize_receive_row(row)
         sequence_display = format_sequence_display(normalized[2], normalized[5])
-        return (normalized[0], normalized[1], sequence_display)
+        action = parse_receive_action(normalized, normalized[1])
+        answer_display = format_answer_display(
+            action, self._send_rows, self._normalize_send_row
+        )
+        return (normalized[0], normalized[1], sequence_display, answer_display)
 
     def _refresh_receive_tree(self):
         for item in self.receive_tree.get_children():
@@ -788,11 +2147,31 @@ class HomePage(tk.Tk):
         new_index = max(0, min(new_index, len(rows)))
         rows.insert(new_index, row_data)
         self._refresh_receive_tree()
+        self.mark_project_dirty()
 
     def delete_receive_sequence(self, index):
         if 0 <= index < len(self._receive_rows):
             self._receive_rows.pop(index)
             self._refresh_receive_tree()
+            self.mark_project_dirty()
+
+    def add_assistant_sequences(self, proposal):
+        """Add sequences proposed by the assistant (after the user confirmed).
+
+        Existing sequences are not changed; names that already exist are skipped.
+        Returns (added_send, added_receive, notes).
+        """
+        from core.bot_sequences import apply_proposal
+
+        new_send, new_receive, added_send, added_receive, notes = apply_proposal(
+            proposal, self._send_rows, self._receive_rows, self.get_display_mode())
+        if added_send or added_receive:
+            self._send_rows = new_send
+            self._receive_rows = new_receive
+            self._refresh_send_tree()
+            self._refresh_receive_tree()
+            self.mark_project_dirty()
+        return added_send, added_receive, notes
 
     def _build_receive_sequences(self):
         frame = ttk.LabelFrame(self, text="", padding=4)
@@ -805,71 +2184,29 @@ class HomePage(tk.Tk):
             bg="#d9d9d9",
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT)
-        ttk.Button(header, text="Add Sequence", command=self.routes.add_receive_sequence).pack(
-            side=tk.RIGHT
+        add_receive_button = ttk.Button(
+            header, text="Add Sequence", command=self.routes.add_receive_sequence
         )
+        add_receive_button.pack(side=tk.RIGHT)
+        self._attach_toolbar_tooltip(add_receive_button, "Add Receive Sequence")
 
         table_frame = tk.Frame(frame)
         table_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("active", "name", "sequence")
+        columns = ("active", "name", "sequence", "answer")
         self.receive_tree = ttk.Treeview(
             table_frame, columns=columns, show="headings", height=8
         )
         self.receive_tree.heading("active", text="Active")
         self.receive_tree.heading("name", text="Name")
         self.receive_tree.heading("sequence", text="Sequence")
+        self.receive_tree.heading("answer", text="Answer")
         self.receive_tree.column("active", width=50, anchor=tk.CENTER)
-        self.receive_tree.column("name", width=120, anchor=tk.W)
-        self.receive_tree.column("sequence", width=200, anchor=tk.W)
+        self.receive_tree.column("name", width=100, anchor=tk.W)
+        self.receive_tree.column("sequence", width=140, anchor=tk.W)
+        self.receive_tree.column("answer", width=100, anchor=tk.W)
 
-        self._receive_rows = [
-            (
-                "☑",
-                "ACK",
-                "<ACK>",
-                DEFAULT_CHECKSUM,
-                DEFAULT_CHECKSUM_DETECT,
-                "HEX",
-                "Comment",
-                0,
-                default_comment_text("ACK"),
-                True,
-                True,
-                True,
-                False,
-            ),
-            (
-                "☑",
-                "Ping received",
-                "2D 2D 2D 2D",
-                DEFAULT_CHECKSUM,
-                DEFAULT_CHECKSUM_DETECT,
-                "HEX",
-                "Stop",
-                0,
-                default_comment_text("Ping received"),
-                True,
-                True,
-                True,
-                True,
-            ),
-            (
-                "☐",
-                "Pong received",
-                "50 6F 6E 67",
-                DEFAULT_CHECKSUM,
-                DEFAULT_CHECKSUM_DETECT,
-                "HEX",
-                "Answer",
-                2,
-                default_comment_text("Pong received"),
-                True,
-                True,
-                True,
-                False,
-            ),
-        ]
+        self._receive_rows = []
         for row in self._receive_rows:
             self.receive_tree.insert("", tk.END, values=self._receive_row_display_values(row))
 
@@ -884,8 +2221,11 @@ class HomePage(tk.Tk):
         return frame
 
     def _clear_communication_panel(self):
-        for text_widget in self._comm_texts.values():
-            text_widget.delete("1.0", tk.END)
+        def clear_texts():
+            for text_widget in self._comm_texts.values():
+                text_widget.delete("1.0", tk.END)
+
+        self._with_comm_text_enabled(clear_texts)
 
     def _build_communication_panel(self):
         frame = ttk.LabelFrame(self, text="", padding=4)
@@ -895,12 +2235,14 @@ class HomePage(tk.Tk):
         tk.Label(header, text="Communication", font=("Segoe UI", 9, "bold")).pack(
             side=tk.RIGHT
         )
-        ttk.Button(
+        clear_button = ttk.Button(
             header,
             text="Clear",
             width=8,
             command=self._clear_communication_panel,
-        ).pack(side=tk.RIGHT, padx=(0, 8))
+        )
+        clear_button.pack(side=tk.RIGHT, padx=(0, 8))
+        self._attach_toolbar_tooltip(clear_button, "Clear Communication Display")
 
         notebook = ttk.Notebook(frame)
         self._comm_notebook = notebook
@@ -928,6 +2270,7 @@ class HomePage(tk.Tk):
 
         notebook.bind("<<NotebookTabChanged>>", self._on_comm_tab_changed)
         notebook.select(1)
+        self._update_keyboard_console_bindings()
         return frame
 
 

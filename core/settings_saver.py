@@ -5,6 +5,7 @@ from copy import deepcopy
 DEFAULT_PROJECT_SETTINGS = {
     "comm_mode": "send_receive",
     "channel": "COM1",
+    "channel2": "COM2",  # second port, used in Monitoring mode
     "baud_rate": "9600",
     "data_bits": "8",
     "parity": "None",

@@ -1,21 +1,26 @@
-"""Shared checksum rule labels for send/receive sequence editors."""
+"""Shared checksum rule labels for send/receive sequence editors.
+
+The text before "#" is the checksum specification (see core/checksum.py); the
+text after it is only a comment, so older project files (whose labels had other
+comments) still load with the same checksum.
+"""
 
 CHECKSUM_OPTIONS = [
     "# (off, no checksum)",
-    "MOD256 # simple one byte sum on all but the last character",
-    "XOR # simple XOR on all but the last character",
+    "MOD256 # one byte sum of all bytes",
+    "XOR # one byte XOR of all bytes",
     "CRC-MODBUS L # MODBUS RTU checksum. Lower Byte first ('Little Endian')",
-    (
-        "(2, -5) LRC-ASCII A @ -4 # MODBUS ASCII checksum is LRC over readable "
-        "HEX data, excluding start/end characters"
-    ),
-    "(2, -2) LRC # Binary LRC, e.g. for POS/payment protocols with STX/ETX telegrams",
-    "(1, 3) CRC-16 @ 10 # CRC-16 checksum over the first 3 bytes.",
-    (
-        "(1, -4) CRC-XMODEM @ -3 # CRC-XMODEM sum placed before a "
-        "end-of-line character, e.g. CR"
-    ),
-    "(2, -5) CRC:8,07,00,00,No,Yes # CRC with custom, non-standard spec.",
+    "MOD65536 # two byte sum (high byte first)",
+    "LRC # negative one byte sum (-MOD256): all bytes incl. the LRC add up to 0",
+    "LRC-ASCII # MODBUS ASCII: LRC as two HEX characters, put before a final CR LF",
+    "CRC-7 # MMC/SD cards (7 bit, poly 09)",
+    "CRC-8 # 8 bit, poly 07",
+    "CRC-DOW # Dallas/Maxim 1-Wire iButton (8 bit, poly 31)",
+    "CRC-CCITT # 16 bit, poly 1021, init FFFF",
+    "CRC-XMODEM # 16 bit, poly 1021, init 0000",
+    "CRC-16 # IBM / ARC (16 bit, poly 8005)",
+    "CRC-32 # PKZip, Ethernet (32 bit)",
+    "CRC:16,1021,FFFF,0000,No,No # your own CRC: width,poly,init,finalXOR,reflectIn,reflectOut",
 ]
 
 CHECKSUM_DETECT_OPTIONS = [
